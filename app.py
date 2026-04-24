@@ -5,19 +5,19 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-import threading
-import time
+import asyncio
 
 import flet as ft
 import yaml
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 
+
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config" / "params.yaml"
 TRADES_DIR = BASE_DIR / "trades"
 STATE_PATH = BASE_DIR / "state" / "bot_state.json"
-RUNNER_PATH = BASE_DIR / "runner_gui.py"
+RUNNER_PATH = BASE_DIR / "runner_gui.py"  # запускаем GUI-раннер
 
 runner_process: Optional[subprocess.Popen] = None
 
@@ -43,26 +43,21 @@ def load_state() -> dict:
 
 
 def load_last_trades() -> pd.DataFrame:
-    """Пробуем взять trades/live_log.csv, иначе последний CSV в trades."""
+    """Читаем именно online-лог trades/live_log.csv."""
     live_log = TRADES_DIR / "live_log.csv"
     if live_log.exists():
         try:
             df = pd.read_csv(live_log)
             return df.tail(50)
         except Exception:
-            pass
+            return pd.DataFrame()
+    return pd.DataFrame()
 
-    if not TRADES_DIR.exists():
-        return pd.DataFrame()
-    csv_files = list(TRADES_DIR.glob("*.csv"))
-    if not csv_files:
-        return pd.DataFrame()
-    latest = max(csv_files, key=os.path.getctime)
-    try:
-        df = pd.read_csv(latest)
-    except Exception:
-        return pd.DataFrame()
-    return df.tail(50)
+
+def utc_to_tz_str(dt_utc: datetime, offset_hours: int, label: str) -> str:
+    tz = timezone(timedelta(hours=offset_hours))
+    dt_local = dt_utc.astimezone(tz)
+    return dt_local.strftime(f"%Y-%m-%d %H:%M:%S {label}")
 
 
 def utc_to_moscow(ts: str) -> str:
@@ -85,8 +80,8 @@ def main(page: ft.Page):
     page.title = "Trading Bot Control"
     page.theme_mode = ft.ThemeMode.DARK
     page.bgcolor = ft.Colors.BLACK
-    page.window_width = 1300
-    page.window_height = 800
+    page.window_width = 1400
+    page.window_height = 850
     page.padding = 20
 
     cfg = load_config()
@@ -120,6 +115,22 @@ def main(page: ft.Page):
         color=ft.Colors.GREY,
     )
 
+    # Часы мировых рынков
+    clock_msk = ft.Text("MSK: --", size=14, color=ft.Colors.AMBER_200)
+    clock_ldn = ft.Text("London: --", size=14, color=ft.Colors.AMBER_200)
+    clock_ny = ft.Text("New York: --", size=14, color=ft.Colors.AMBER_200)
+    clock_sh = ft.Text("Shanghai: --", size=14, color=ft.Colors.AMBER_200)
+
+    clocks_row = ft.Row(
+        [
+            clock_msk,
+            clock_ldn,
+            clock_ny,
+            clock_sh,
+        ],
+        spacing=20,
+    )
+
     trades_table = ft.DataTable(
         columns=[
             ft.DataColumn(ft.Text("entry_time")),
@@ -139,7 +150,18 @@ def main(page: ft.Page):
 
     status = ft.Text("Ready", color=ft.Colors.AMBER_300)
 
+    # --------- helpers ----------
+
     def update_ui():
+        now_utc = datetime.now(tz=timezone.utc)
+
+        # --- часы ---
+        clock_msk.value = utc_to_tz_str(now_utc, 3, "MSK")
+        clock_ldn.value = utc_to_tz_str(now_utc, 0, "LON")   # Лондон ~ UTC
+        clock_ny.value = utc_to_tz_str(now_utc, -4, "NY")    # грубо UTC-4
+        clock_sh.value = utc_to_tz_str(now_utc, 8, "SHA")    # Шанхай UTC+8
+
+        # --- state.json ---
         st = load_state()
         mode = st.get("mode", "--")
         equity = st.get("equity", "--")
@@ -150,11 +172,10 @@ def main(page: ft.Page):
         state_text.value = f"Mode: {mode} | Equity: {equity} | Positions: {len(positions)}"
         ts_text.value = f"Updated: {ts_msk}"
 
-        # trades
+        # --- trades: live_log.csv ---
         df = load_last_trades()
         rows = []
         if not df.empty:
-            # под твой формат: event, ticker, direction, qty, entry_price, exec_price, pnl, opened_at, timestamp
             for _, row in df.iterrows():
                 entry_time = row.get("entry_time") or row.get("opened_at", "")
                 exit_time = row.get("exit_time") or row.get("timestamp", "")
@@ -177,7 +198,7 @@ def main(page: ft.Page):
                 )
         trades_table.rows = rows
 
-        # quotes
+        # --- quotes ---
         quotes_list.controls.clear()
         prices = st.get("prices") or st.get("quotes") or {}
         if isinstance(prices, dict) and prices:
@@ -194,7 +215,7 @@ def main(page: ft.Page):
                 ft.Text("Нет котировок в state", color=ft.Colors.GREY, size=14)
             )
 
-        # positions
+        # --- positions ---
         positions_list.controls.clear()
         if positions:
             for p in positions:
@@ -216,9 +237,10 @@ def main(page: ft.Page):
 
         page.update()
 
-    def auto_refresh_loop():
+    async def auto_refresh():
+        # 1 секунда — часы и state максимально живые
         while True:
-            time.sleep(3)
+            await asyncio.sleep(1)
             update_ui()
 
     def _start_runner(args_list: list[str], label: str):
@@ -246,9 +268,6 @@ def main(page: ft.Page):
         except Exception as e:
             status.value = f"Ошибка запуска: {e}"
         page.update()
-
-    def on_backtest(e):
-        _start_runner(["--mode", "backtest"], "Backtest")
 
     def on_paper(e):
         _start_runner(["--mode", "paper"], "Paper")
@@ -281,7 +300,6 @@ def main(page: ft.Page):
 
     buttons_row = ft.Row(
         [
-            ft.Button(content=ft.Text("Backtest"), on_click=on_backtest),
             ft.Button(content=ft.Text("Paper"), on_click=on_paper),
             ft.Button(content=ft.Text("Live DRY"), on_click=on_live_dry),
             ft.Button(
@@ -312,10 +330,11 @@ def main(page: ft.Page):
             risk_text,
             state_text,
             ts_text,
+            clocks_row,
             ft.Container(
                 content=trades_table,
                 expand=False,
-                height=400,
+                height=420,
                 margin=ft.Margin(top=10, right=10, bottom=10, left=0),
             ),
         ],
@@ -328,7 +347,7 @@ def main(page: ft.Page):
             ft.Container(
                 content=quotes_list,
                 expand=False,
-                height=200,
+                height=220,
                 bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.BLUE_GREY_900),
                 padding=10,
                 border_radius=5,
@@ -337,7 +356,7 @@ def main(page: ft.Page):
             ft.Container(
                 content=positions_list,
                 expand=False,
-                height=300,
+                height=320,
                 bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.GREEN_900),
                 padding=10,
                 border_radius=5,
@@ -357,7 +376,8 @@ def main(page: ft.Page):
 
     page.add(main_row, buttons_row)
 
-    page.run_thread(auto_refresh_loop)
+    # авто-обновление раз в 1 секунду + стартовый снэпшот
+    page.run_task(auto_refresh)
     update_ui()
 
 
