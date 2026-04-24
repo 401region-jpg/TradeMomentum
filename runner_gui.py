@@ -493,7 +493,7 @@ async def run_live(cfg: dict) -> None:
 
     # --- LIVE: синхронизируем капитал с реальным счётом ---
     try:
-        real_equity = broker.get_total_equity()
+        real_equity = await broker.get_total_equity()
         risk.update_capital(real_equity)
         logger.info(
             "[LIVE] Обновил капитал риска по счёту брокера: %.2f ₽",
@@ -539,11 +539,12 @@ async def run_live(cfg: dict) -> None:
 
     async def snapshot_live_state(reason: str = "tick") -> None:
         try:
-            total_equity = broker.get_total_equity()
+            total_equity = await broker.get_total_equity()
         except Exception:
             total_equity = None
 
         positions_view = []
+
         for ticker, pos in live_positions.items():
             positions_view.append(
                 {
