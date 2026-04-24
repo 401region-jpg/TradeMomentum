@@ -23,7 +23,6 @@ from typing import Optional
 
 import yaml
 
-
 logger = logging.getLogger(__name__)
 
 # ── State для GUI ─────────────────────────────────────────────────────────────
@@ -342,7 +341,6 @@ async def run_paper(cfg: dict) -> None:
                         mode="paper",
                     )
 
-                    # online лог
                     opened_at = datetime.fromisoformat(meta.get("entry_time", now_utc.isoformat()))
                     append_live_trade(
                         event="close",
@@ -417,7 +415,6 @@ async def run_paper(cfg: dict) -> None:
                         mode="paper",
                     )
 
-                    # online лог — open
                     append_live_trade(
                         event="open",
                         ticker=ticker,
@@ -453,17 +450,16 @@ async def run_paper(cfg: dict) -> None:
     finally:
         if not stop_notified:
             await notifier.notify_bot_stopped(stop_reason)
-        # сохраняем paper_*.csv стандартным способом
-        from runner import _save_paper_trades  # импортируем из твоего runner.py
+        from runner import _save_paper_trades
         _save_paper_trades(broker.get_trade_log())
         await snapshot_paper_state(reason="final")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# LIVE
+# LIVE (REAL)
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def run_live(cfg: dict, dry_run: bool = False) -> None:
+async def run_live(cfg: dict) -> None:
     from broker.base import OrderDirection
     from broker.broker_tinkoff import TinkoffBrokerClient
     from config.settings import (
@@ -489,10 +485,10 @@ async def run_live(cfg: dict, dry_run: bool = False) -> None:
     notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, cfg)
     feed = DataFeed(TINKOFF_API_TOKEN, TINKOFF_SANDBOX)
     broker = TinkoffBrokerClient(
-    token=TINKOFF_API_TOKEN,
-    account_id=TINKOFF_ACCOUNT_ID,
-    sandbox=TINKOFF_SANDBOX,
-    live_confirmed=True,  # GUI live всегда с явным подтверждением через кнопку
+        token=TINKOFF_API_TOKEN,
+        account_id=TINKOFF_ACCOUNT_ID,
+        sandbox=TINKOFF_SANDBOX,
+        live_confirmed=True,  # GUI live всегда с явным подтверждением через кнопку
     )
 
     tf_main = cfg["timeframe"]
@@ -521,10 +517,7 @@ async def run_live(cfg: dict, dry_run: bool = False) -> None:
         df = await feed.get_candles(figi, tf_main, from_dt, to_dt)
         candle_buffers[figi] = df.to_dict("records")
 
-    await notifier.notify_bot_started(
-        "live-dry-run" if dry_run else "live",
-        list(ticker_by_figi.values()),
-    )
+    await notifier.notify_bot_started("live", list(ticker_by_figi.values()))
 
     import pandas as pd
 
@@ -617,10 +610,11 @@ async def run_live(cfg: dict, dry_run: bool = False) -> None:
                 await notifier.notify_error(f"Ошибка стратегии {ticker}", e)
                 continue
 
+            # SL/TP по уже открытым позициям
             if ticker in live_positions:
                 pos = live_positions[ticker]
-                close_reason = None
-                close_price = None
+                close_reason: Optional[str] = None
+                close_price: Optional[Decimal] = None
 
                 if pos["side"] == "long":
                     if Decimal(str(candle["low"])) <= pos["sl"]:
@@ -643,16 +637,12 @@ async def run_live(cfg: dict, dry_run: bool = False) -> None:
                         OrderDirection.SELL if pos["side"] == "long" else OrderDirection.BUY
                     )
 
-                    exit_direction = (
-    OrderDirection.SELL if pos["side"] == "long" else OrderDirection.BUY
-    )
-
-    await broker.place_market_order(
-        figi,
-        ticker,
-        exit_direction,
-        qty_to_close,
-    )
+                    await broker.place_market_order(
+                        figi,
+                        ticker,
+                        exit_direction,
+                        qty_to_close,
+                    )
 
                     pnl = (close_price - pos["entry_price"]) * Decimal(
                         qty_to_close if pos["side"] == "long" else -qty_to_close
@@ -687,6 +677,7 @@ async def run_live(cfg: dict, dry_run: bool = False) -> None:
                     await snapshot_live_state(reason=f"close_{close_reason}")
                     continue
 
+            # Открытие новых позиций
             opened_here = False
             for sig in signals:
                 if not sig.is_entry or ticker in live_positions:
@@ -713,10 +704,10 @@ async def run_live(cfg: dict, dry_run: bool = False) -> None:
                 )
 
                 order = await broker.place_market_order(figi, ticker, direction, qty)
-    if order.status.value == "rejected":
-    logger.error("[%s] Ордер отклонён: %s", ticker, order.error_message)
-    continue
-    entry_price = order.filled_price or price
+                if order.status.value == "rejected":
+                    logger.error("[%s] Ордер отклонён: %s", ticker, order.error_message)
+                    continue
+                entry_price = order.filled_price or price
 
                 live_positions[ticker] = {
                     "side": "long" if sig.type == SignalType.LONG else "short",
@@ -800,16 +791,19 @@ async def main() -> None:
     logger.info("GUI Runner | Режим: %s | Конфиг: %s", args.mode.upper(), args.config)
 
     try:
-if args.mode == "paper":
-    await run_paper(cfg)
-elif args.mode == "live":
-    if not args.confirm_live:
-        logger.critical(
-            "⛔ LIVE требует --confirm-live. "
-            "Запустите через GUI 'Live' или добавьте --confirm-live."
-        )
-        sys.exit(1)
-    await run_live(cfg)
+        if args.mode == "paper":
+            await run_paper(cfg)
+        elif args.mode == "live":
+            if not args.confirm_live:
+                logger.critical(
+                    "⛔ LIVE требует --confirm-live. "
+                    "Запустите через GUI 'Live' или добавьте --confirm-live."
+                )
+                sys.exit(1)
+            await run_live(cfg)
+    except Exception:
+        logger.exception("Необработанная ошибка в runner_gui.main()")
+        raise
 
 
 if __name__ == "__main__":
