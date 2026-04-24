@@ -287,7 +287,14 @@ class RiskManager:
         lot_size: int,
         sl_distance: Decimal,
         dt_utc: Optional[datetime.datetime] = None,
+        margin_per_lot: Optional[Decimal] = None,
     ) -> int:
+        """
+        price         — цена входа за 1 контракт
+        lot_size      — размер лота в контрактах (обычно 1)
+        sl_distance   — расстояние до стопа в рублях на 1 контракт
+        margin_per_lot — ГО на 1 контракт (если None — используем self._margin_per_lot)
+        """
         if sl_distance <= 0 or price <= 0:
             return 0
 
@@ -309,19 +316,25 @@ class RiskManager:
         leverage = Decimal(str(self._max_leverage))
         capital_dec = self._capital
 
-        # 1) Ограничение по стоимости позиции (как раньше)
+        # 1) Ограничение по стоимости позиции
         max_pos_val = capital_dec * Decimal(str(position_pct)) * leverage
         lots_cap = int(max_pos_val / (price * lot_size))
 
-        # 2) Ограничение по стоп‑риску (как раньше)
+        # 2) Ограничение по стоп‑риску
         risk_budget = capital_dec * Decimal(str(position_pct))
         risk_per_lot = sl_distance * lot_size
         lots_risk = int(risk_budget / risk_per_lot) if risk_per_lot > 0 else 0
 
-        # 3) Ограничение по ГО (margin_per_lot)
-        if self._margin_per_lot is not None and self._margin_per_lot > 0:
+        # 3) Ограничение по ГО
+        eff_margin_per_lot: Optional[Decimal] = None
+        if margin_per_lot is not None and margin_per_lot > 0:
+            eff_margin_per_lot = margin_per_lot
+        elif self._margin_per_lot is not None and self._margin_per_lot > 0:
+            eff_margin_per_lot = self._margin_per_lot
+
+        if eff_margin_per_lot is not None:
             margin_budget = capital_dec * Decimal(str(position_pct))
-            lots_margin = int(margin_budget / self._margin_per_lot)
+            lots_margin = int(margin_budget / eff_margin_per_lot)
         else:
             lots_margin = lots_cap  # если ГО не задано, не ограничиваем дополнительно
 
