@@ -120,7 +120,7 @@ strategy:
 
 risk:
   capital_rub: 1000.0
-  max_position_pct: 0.30
+  max_position_pct: 1
   max_leverage: 8
 
   daily_loss_limit_pct: 0.20
@@ -135,7 +135,7 @@ risk:
     normal:
       start: "09:00"
       end: "16:00"
-      max_position_pct: 0.30
+      max_position_pct: 1
       label: "NORMAL"
     boost:
       start: "16:00"
