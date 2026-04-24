@@ -1,11 +1,12 @@
 """
-risk/risk_manager.py  v5
+risk/risk_manager.py  v5 + margin_per_lot
 
 Ключевые изменения:
   - Сессионный риск: normal / boost / evening (разный max_position_pct)
   - Портфельный счётчик сделок: max_trades_per_day суммарно по всем инструментам
-  - get_session_position_pct() → возвращает pct для текущего времени МСК
+  - get_session_info() → возвращает pct для текущего времени МСК
   - Логи показывают: "SESSION=BOOST | position_pct=8.0%"
+  - УЧЁТ ГО: margin_per_lot — ограничивает qty по доступной марже
 """
 
 from __future__ import annotations
@@ -80,6 +81,16 @@ class RiskManager:
         self._weekly_loss_limit_pct = r["weekly_loss_limit_pct"]
         self._max_trades_per_day = r["max_trades_per_day"]  # портфельный лимит
         self._max_positions = s["max_positions"]
+
+        # ГО на 1 лот (в рублях); если не задано, считаем, что не ограничивает
+        self._margin_per_lot: Optional[Decimal] = None
+        margin_cfg = r.get("margin_per_lot")
+        if margin_cfg is not None:
+            try:
+                self._margin_per_lot = Decimal(str(margin_cfg))
+                logger.info("Margin per lot (ГО) задан: %.2f ₽", float(self._margin_per_lot))
+            except Exception:
+                logger.warning("Не удалось распарсить margin_per_lot=%r", margin_cfg)
 
         self._max_consec_losses = r.get("max_consecutive_losses", 999)
         self._cooldown_min = r.get("cooldown_after_loss_min", 0)
@@ -159,7 +170,7 @@ class RiskManager:
             self._consec_losses += 1
             self._last_loss_time = datetime.datetime.now(datetime.UTC)
             logger.warning(
-                "📉 Убыток %.2f ₽ | Серия: %d/%d | " "Портфель сделок: %d/%d",
+                "📉 Убыток %.2f ₽ | Серия: %d/%d | Портфель сделок: %d/%d",
                 float(pnl),
                 self._consec_losses,
                 self._max_consec_losses,
@@ -183,7 +194,9 @@ class RiskManager:
 
     def reset_daily(self) -> None:
         logger.info(
-            "🔄 Сброс дня. PnL: %.2f ₽ | Сделок: %d", float(self._day_pnl), self._portfolio_trades
+            "🔄 Сброс дня. PnL: %.2f ₽ | Сделок: %d",
+            float(self._day_pnl),
+            self._portfolio_trades,
         )
         self._day_pnl = Decimal("0")
         self._portfolio_trades = 0
@@ -218,20 +231,23 @@ class RiskManager:
         limit = self._capital * Decimal(str(self._daily_loss_limit_pct))
         if self._day_pnl < -limit:
             raise DailyLimitExceeded(
-                f"Дневной лимит: {float(self._day_pnl):.2f} ₽ " f"(лимит -{float(limit):.2f} ₽)"
+                f"Дневной лимит: {float(self._day_pnl):.2f} ₽ "
+                f"(лимит -{float(limit):.2f} ₽)"
             )
 
     def _check_weekly_limit(self) -> None:
         limit = self._capital * Decimal(str(self._weekly_loss_limit_pct))
         if self._week_pnl < -limit:
             raise WeeklyLimitExceeded(
-                f"Недельный лимит: {float(self._week_pnl):.2f} ₽ " f"(лимит -{float(limit):.2f} ₽)"
+                f"Недельный лимит: {float(self._week_pnl):.2f} ₽ "
+                f"(лимит -{float(limit):.2f} ₽)"
             )
 
     def _check_portfolio_trades(self) -> None:
         if self._portfolio_trades >= self._max_trades_per_day:
             raise MaxTradesPerDayExceeded(
-                f"Портфельный лимит сделок: {self._portfolio_trades}/" f"{self._max_trades_per_day}"
+                f"Портфельный лимит сделок: {self._portfolio_trades}/"
+                f"{self._max_trades_per_day}"
             )
 
     def _check_max_positions(self, count: int) -> None:
@@ -247,7 +263,9 @@ class RiskManager:
     def _check_cooldown(self) -> None:
         if self._cooldown_min <= 0 or self._last_loss_time is None:
             return
-        elapsed = (datetime.datetime.now(datetime.UTC) - self._last_loss_time).total_seconds() / 60
+        elapsed = (
+            datetime.datetime.now(datetime.UTC) - self._last_loss_time
+        ).total_seconds() / 60
         if elapsed < self._cooldown_min:
             raise CooldownActive(f"Кулдаун: ещё {int(self._cooldown_min - elapsed)} мин")
 
@@ -261,7 +279,7 @@ class RiskManager:
             self.reset_weekly()
             self._current_week = week
 
-    # ── Размер позиции (с учётом сессии) ─────────────────────────────────────
+    # ── Размер позиции (с учётом сессии и ГО) ────────────────────────────────
 
     def calculate_quantity(
         self,
@@ -289,38 +307,58 @@ class RiskManager:
         )
 
         leverage = Decimal(str(self._max_leverage))
-        max_pos_val = self._capital * Decimal(str(position_pct)) * leverage
+        capital_dec = self._capital
+
+        # 1) Ограничение по стоимости позиции (как раньше)
+        max_pos_val = capital_dec * Decimal(str(position_pct)) * leverage
         lots_cap = int(max_pos_val / (price * lot_size))
 
-        risk_budget = self._capital * Decimal(str(position_pct))
+        # 2) Ограничение по стоп‑риску (как раньше)
+        risk_budget = capital_dec * Decimal(str(position_pct))
         risk_per_lot = sl_distance * lot_size
         lots_risk = int(risk_budget / risk_per_lot) if risk_per_lot > 0 else 0
 
-        qty = min(lots_cap, lots_risk)
+        # 3) Ограничение по ГО (margin_per_lot)
+        if self._margin_per_lot is not None and self._margin_per_lot > 0:
+            margin_budget = capital_dec * Decimal(str(position_pct))
+            lots_margin = int(margin_budget / self._margin_per_lot)
+        else:
+            lots_margin = lots_cap  # если ГО не задано, не ограничиваем дополнительно
+
+        # Итоговое количество — минимум из трёх
+        qty = min(lots_cap, lots_risk, lots_margin)
 
         if qty <= 0:
             logger.warning(
-                "qty=0: capital=%.2f price=%.4f sl=%.4f lot=%d ses=%s",
-                float(self._capital),
+                "qty=0: capital=%.2f price=%.4f sl=%.4f lot=%d ses=%s "
+                "(cap=%d risk=%d margin=%d)",
+                float(capital_dec),
                 float(price),
                 float(sl_distance),
                 lot_size,
                 ses_label,
+                lots_cap,
+                lots_risk,
+                lots_margin,
             )
         else:
             sl_risk = float(sl_distance) * qty * lot_size
             tp_goal = sl_risk * self._configured_rr
             logger.info(
-                "📊 %s | %d лот(ов) @ %.4f | R:R=%.1f | " "SL-риск=%.2f ₽ | TP-цель=%.2f ₽",
+                "📊 %s | %d лот(ов) @ %.4f | R:R=%.1f | SL-риск=%.2f ₽ | TP-цель=%.2f ₽ "
+                "(cap=%d risk=%d margin=%d)",
                 ses_label,
                 qty,
                 float(price),
                 self._configured_rr,
                 sl_risk,
                 tp_goal,
+                lots_cap,
+                lots_risk,
+                lots_margin,
             )
 
-        return qty
+        return max(qty, 0)
 
     # ── Геттеры ───────────────────────────────────────────────────────────────
 
