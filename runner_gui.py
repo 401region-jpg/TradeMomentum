@@ -491,6 +491,17 @@ async def run_live(cfg: dict) -> None:
         live_confirmed=True,  # GUI live всегда с явным подтверждением через кнопку
     )
 
+    # --- LIVE: синхронизируем капитал с реальным счётом ---
+    try:
+        real_equity = broker.get_total_equity()
+        risk.update_capital(real_equity)
+        logger.info(
+            "[LIVE] Обновил капитал риска по счёту брокера: %.2f ₽",
+            float(real_equity),
+        )
+    except Exception as e:
+        logger.warning("[LIVE] Не удалось обновить капитал из брокера: %s", e)
+
     tf_main = cfg["timeframe"]
     tf_global = cfg.get("global_trend_timeframe", "1h")
     gt_cfg = cfg["strategy"].get("global_trend", {})
