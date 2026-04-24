@@ -19,6 +19,9 @@ TRADES_DIR = BASE_DIR / "trades"
 STATE_PATH = BASE_DIR / "state" / "bot_state.json"
 RUNNER_PATH = BASE_DIR / "runner_gui.py"  # запускаем GUI-раннер
 
+# стоп-флаг для управления раннером
+STOP_FLAG_PATH = BASE_DIR / "state" / "stop.flag"
+
 runner_process: Optional[subprocess.Popen] = None
 
 
@@ -94,6 +97,14 @@ def main(page: ft.Page):
 
     # новая сессия — чистим онлайн-лог
     reset_live_log()
+
+    # при старте GUI очищаем возможный старый стоп-флаг
+    STOP_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if STOP_FLAG_PATH.exists():
+        try:
+            STOP_FLAG_PATH.unlink()
+        except Exception:
+            pass
 
     page.title = "Trading Bot Control"
     page.theme_mode = ft.ThemeMode.DARK
@@ -286,6 +297,14 @@ def main(page: ft.Page):
         nonlocal status
         global runner_process
 
+        # при старте нового раннера убираем стоп-флаг
+        STOP_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if STOP_FLAG_PATH.exists():
+            try:
+                STOP_FLAG_PATH.unlink()
+            except Exception:
+                pass
+
         if runner_process and runner_process.poll() is None:
             status.value = f"Уже запущен PID={runner_process.pid}"
             page.update()
@@ -314,6 +333,14 @@ def main(page: ft.Page):
     def on_live(e):
         nonlocal status
         global runner_process
+
+        # при старте LIVE убираем стоп-флаг
+        STOP_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if STOP_FLAG_PATH.exists():
+            try:
+                STOP_FLAG_PATH.unlink()
+            except Exception:
+                pass
 
         if runner_process and runner_process.poll() is None:
             status.value = f"Уже запущен PID={runner_process.pid}"
@@ -345,11 +372,22 @@ def main(page: ft.Page):
         nonlocal status
         global runner_process
 
+        # создаём стоп-флаг для раннера
+        try:
+            STOP_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            STOP_FLAG_PATH.write_text("stop", encoding="utf-8")
+        except Exception:
+            pass
+
+        # дополнительно убиваем subprocess, если он ещё жив
         if runner_process and runner_process.poll() is None:
-            runner_process.terminate()
-            status.value = "Runner остановлен"
+            try:
+                runner_process.terminate()
+                status.value = "Runner остановлен (STOP-флаг + terminate)"
+            except Exception as ex:
+                status.value = f"Ошибка остановки runner: {ex}"
         else:
-            status.value = "Runner не запущен"
+            status.value = "Runner не запущен (STOP-флаг записан)"
         page.update()
 
     def on_refresh(e=None):
