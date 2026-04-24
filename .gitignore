@@ -7,4 +7,3 @@ logs/
 trades/
 state/
 mypy-report/
-state/bot_state.json
