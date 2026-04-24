@@ -92,7 +92,7 @@ def utc_to_moscow(ts: str) -> str:
 def main(page: ft.Page):
     global runner_process
 
-    # сессия — чистим онлайн-лог
+    # новая сессия — чистим онлайн-лог
     reset_live_log()
 
     page.title = "Trading Bot Control"
@@ -208,8 +208,6 @@ def main(page: ft.Page):
             real_live_banner.value = "REAL LIVE: торгуем боевыми деньгами"
         elif mode == "live" and tinkoff_sandbox:
             real_live_banner.value = "LIVE (sandbox): торговля в песочнице"
-        elif mode == "live-dry-run":
-            real_live_banner.value = "LIVE-DRY-RUN: ордера НЕ отправляются"
         else:
             real_live_banner.value = ""
 
@@ -313,17 +311,35 @@ def main(page: ft.Page):
     def on_paper(e):
         _start_runner(["--mode", "paper"], "PAPER")
 
-    def on_live_dry(e):
-        _start_runner(
-            ["--mode", "live", "--live-dry-run", "--confirm-live"],
-            "LIVE-DRYRUN",
-        )
+    def on_live(e):
+        nonlocal status
+        global runner_process
 
-    def on_live_real(e):
-        _start_runner(
-            ["--mode", "live", "--confirm-live"],
-            "LIVE-REAL",
-        )
+        if runner_process and runner_process.poll() is None:
+            status.value = f"Уже запущен PID={runner_process.pid}"
+            page.update()
+            return
+
+        # для LIVE подтверждаем real-режим для config.settings
+        env = os.environ.copy()
+        env["TRADER_LIVE_CONFIRMED"] = "true"
+
+        cmd = [sys.executable, str(RUNNER_PATH), "--mode", "live", "--confirm-live"]
+
+        try:
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NO_WINDOW
+            runner_process = subprocess.Popen(
+                cmd,
+                cwd=str(BASE_DIR),
+                env=env,
+                creationflags=creationflags,
+            )
+            status.value = f"LIVE стартовал, PID={runner_process.pid}"
+        except Exception as e:
+            status.value = f"Ошибка запуска LIVE: {e}"
+        page.update()
 
     def on_stop(e):
         nonlocal status
@@ -341,15 +357,14 @@ def main(page: ft.Page):
 
     buttons_row = ft.Row(
         [
-            ft.Button(content=ft.Text("Paper"), on_click=on_paper),
-            ft.Button(content=ft.Text("Live DRY"), on_click=on_live_dry),
+            ft.Button(content=ft.Text("PAPER"), on_click=on_paper),
             ft.Button(
-                content=ft.Text("Live REAL"),
+                content=ft.Text("LIVE"),
                 style=ft.ButtonStyle(
                     bgcolor=ft.Colors.RED_700,
                     color=ft.Colors.WHITE,
                 ),
-                on_click=on_live_real,
+                on_click=on_live,
             ),
             ft.Button(
                 content=ft.Text("Stop"),
