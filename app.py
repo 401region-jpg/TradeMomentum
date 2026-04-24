@@ -17,7 +17,7 @@ BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config" / "params.yaml"
 TRADES_DIR = BASE_DIR / "trades"
 STATE_PATH = BASE_DIR / "state" / "bot_state.json"
-RUNNER_PATH = BASE_DIR / "runner.py"
+RUNNER_PATH = BASE_DIR / "runner_gui.py"
 
 runner_process: Optional[subprocess.Popen] = None
 
