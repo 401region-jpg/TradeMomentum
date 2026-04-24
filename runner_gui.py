@@ -370,6 +370,7 @@ async def run_paper(cfg: dict) -> None:
 
             for sig in signals:
                 price = Decimal(str(candle["close"]))
+
                 if sig.is_entry:
                     if ticker in pos_by_ticker:
                         continue
@@ -696,17 +697,36 @@ async def run_live(cfg: dict) -> None:
                     continue
 
                 price = Decimal(str(candle["close"]))
+
                 try:
                     risk.check_entry_allowed(len(live_positions), now_utc)
                 except RiskViolation as e:
                     logger.warning("[%s] Риск-блок: %s", ticker, e)
                     continue
 
+                # --- NEW: запрашиваем ГО у Tinkoff API для этого фьючерса ---
+                try:
+                    margin_per_lot = await broker.get_futures_margin(figi)
+                    logger.info(
+                        "[%s] Margin per lot (ГО) по данным брокера: %.2f ₽",
+                        ticker,
+                        float(margin_per_lot),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Не удалось получить ГО через GetFuturesMargin: %s. "
+                        "Использую только риск-модель без ГО.",
+                        ticker,
+                        e,
+                    )
+                    margin_per_lot = None
+
                 qty = risk.calculate_quantity(
-                    price,
-                    lot,
-                    abs(price - sig.sl_price),
-                    now_utc,
+                    price=price,
+                    lot_size=lot,
+                    sl_distance=abs(price - sig.sl_price),
+                    dt_utc=now_utc,
+                    margin_per_lot=margin_per_lot,
                 )
                 if qty <= 0:
                     continue
