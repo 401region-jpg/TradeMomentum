@@ -40,16 +40,27 @@ if MODE not in ALLOWED_MODES:
     raise ValueError(f"MODE={MODE!r} недопустим. Допустимы: {ALLOWED_MODES}")
 
 # ── КРИТИЧЕСКАЯ ЗАЩИТА live-режима ───────────────────────────────────────────
-if MODE == "live" and not TINKOFF_SANDBOX:
-    logging.getLogger(__name__).critical(
-        "\n" + "=" * 60 + "\n"
-        "ОБНАРУЖЕН LIVE РЕЖИМ. ОСТАНОВИЛСЯ.\n"
-        "Нужна ваша команда и явное подтверждение\n"
-        "для перехода к реальной торговле.\n"
-        "Запустите: python runner.py --mode live --confirm-live\n"
-        + "=" * 60
-    )
+import os
+import logging
 
+logger = logging.getLogger(__name__)
+
+TINKOFF_SANDBOX = os.getenv("TINKOFF_SANDBOX", "true").lower() in ("1", "true", "yes")
+
+# универсальное подтверждение live
+LIVE_CONFIRMED = os.getenv("TRADER_LIVE_CONFIRMED", "").lower() in ("1", "true", "yes")
+
+if not TINKOFF_SANDBOX and not LIVE_CONFIRMED:
+    logger.critical(
+        "\n" + "="*60 + "\n"
+        "ОБНАРУЖЕН LIVE РЕЖИМ. ОСТАНОВИЛСЯ.\n"
+        "Нужна явная команда для перехода к реальной торговле.\n"
+        "Варианты:\n"
+        " - python runner.py --mode live --confirm-live\n"
+        " - или установить TRADER_LIVE_CONFIRMED=true для GUI.\n"
+        + "="*60
+    )
+    raise SystemExit(1)
 
 # ── Параметры стратегии и риска из YAML ──────────────────────────────────────
 _PARAMS_PATH = Path(__file__).parent / "params.yaml"
