@@ -112,7 +112,7 @@ risk:
   capital_rub: 1000.0
 
   # Базовый размер — поднят для достижения 50%/мес
-  max_position_pct: 0.45
+  max_position_pct: 1
   max_leverage: 8
 
   daily_loss_limit_pct: 0.25    # до -25% за день
@@ -128,20 +128,20 @@ risk:
     normal:
       start: "09:00"
       end: "16:00"
-      max_position_pct: 0.45
+      max_position_pct: 1
       label: "NORMAL"
 
     boost:
       # 16:00-20:00 МСК — вечерний импульс, максимальный риск
       start: "16:00"
       end: "20:00"
-      max_position_pct: 0.55
+      max_position_pct: 1
       label: "BOOST"
 
     evening:
       start: "20:00"
       end: "23:50"
-      max_position_pct: 0.40
+      max_position_pct: 1
       label: "EVENING"
       require_global_trend: true
 
