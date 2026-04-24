@@ -6,11 +6,11 @@ from pathlib import Path
 from typing import Optional
 
 import asyncio
+from datetime import datetime, timezone, timedelta
 
 import flet as ft
 import yaml
 import pandas as pd
-from datetime import datetime, timezone, timedelta
 
 
 BASE_DIR = Path(__file__).parent
@@ -21,6 +21,8 @@ RUNNER_PATH = BASE_DIR / "runner_gui.py"  # запускаем GUI-раннер
 
 runner_process: Optional[subprocess.Popen] = None
 
+
+# ── вспомогательные функции ──────────────────────────────────────────────────
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
@@ -54,6 +56,17 @@ def load_last_trades() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def reset_live_log() -> None:
+    """Очищаем trades/live_log.csv при старте GUI (новая сессия)."""
+    live_log = TRADES_DIR / "live_log.csv"
+    TRADES_DIR.mkdir(parents=True, exist_ok=True)
+    if live_log.exists():
+        try:
+            live_log.unlink()
+        except Exception:
+            pass
+
+
 def utc_to_tz_str(dt_utc: datetime, offset_hours: int, label: str) -> str:
     tz = timezone(timedelta(hours=offset_hours))
     dt_local = dt_utc.astimezone(tz)
@@ -74,8 +87,13 @@ def utc_to_moscow(ts: str) -> str:
         return ts
 
 
+# ── main ─────────────────────────────────────────────────────────────────────
+
 def main(page: ft.Page):
     global runner_process
+
+    # сессия — чистим онлайн-лог
+    reset_live_log()
 
     page.title = "Trading Bot Control"
     page.theme_mode = ft.ThemeMode.DARK
@@ -91,6 +109,11 @@ def main(page: ft.Page):
         or "Trading Bot"
     )
     capital_rub = cfg.get("risk", {}).get("capital_rub", "--")
+
+    # флаг песочницы (для подсветки REAL LIVE)
+    tinkoff_sandbox = str(
+        cfg.get("broker", {}).get("tinkoff_sandbox", os.getenv("TINKOFF_SANDBOX", "true"))
+    ).lower() in ("1", "true", "yes")
 
     title = ft.Text(
         strategy_name,
@@ -113,6 +136,14 @@ def main(page: ft.Page):
         "Updated: --",
         size=14,
         color=ft.Colors.GREY,
+    )
+
+    # индикатор реального лайва
+    real_live_banner = ft.Text(
+        "",
+        size=16,
+        color=ft.Colors.RED_400,
+        weight=ft.FontWeight.BOLD,
     )
 
     # Часы мировых рынков
@@ -171,6 +202,16 @@ def main(page: ft.Page):
 
         state_text.value = f"Mode: {mode} | Equity: {equity} | Positions: {len(positions)}"
         ts_text.value = f"Updated: {ts_msk}"
+
+        # баннер REAL LIVE
+        if mode == "live" and not tinkoff_sandbox:
+            real_live_banner.value = "REAL LIVE: торгуем боевыми деньгами"
+        elif mode == "live" and tinkoff_sandbox:
+            real_live_banner.value = "LIVE (sandbox): торговля в песочнице"
+        elif mode == "live-dry-run":
+            real_live_banner.value = "LIVE-DRY-RUN: ордера НЕ отправляются"
+        else:
+            real_live_banner.value = ""
 
         # --- trades: live_log.csv ---
         df = load_last_trades()
@@ -270,7 +311,7 @@ def main(page: ft.Page):
         page.update()
 
     def on_paper(e):
-        _start_runner(["--mode", "paper"], "Paper")
+        _start_runner(["--mode", "paper"], "PAPER")
 
     def on_live_dry(e):
         _start_runner(
@@ -319,6 +360,7 @@ def main(page: ft.Page):
                 on_click=on_stop,
             ),
             ft.Button(content=ft.Text("Refresh"), on_click=on_refresh),
+            real_live_banner,
         ],
         spacing=10,
         alignment=ft.MainAxisAlignment.START,
