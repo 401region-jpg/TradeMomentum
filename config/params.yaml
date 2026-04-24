@@ -140,12 +140,12 @@ risk:
     boost:
       start: "16:00"
       end: "20:00"
-      max_position_pct: 0.35
+      max_position_pct: 1
       label: "BOOST"
     evening:
       start: "20:00"
       end: "23:50"
-      max_position_pct: 0.30
+      max_position_pct: 1
       label: "EVENING"
       require_global_trend: true
 
