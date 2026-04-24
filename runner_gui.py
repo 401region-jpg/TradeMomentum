@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 STATE_PATH = Path("state/bot_state.json")
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+# Стоп‑флаг, который может создать GUI (app.py), чтобы остановить раннер
+STOP_FLAG_PATH = Path("state/stop.flag")
+
 
 def write_bot_state(state: dict) -> None:
     try:
@@ -151,6 +154,10 @@ async def run_paper(cfg: dict) -> None:
     from strategy.base import SignalType
     from strategy.momentum import MomentumStrategy, compute_global_trend
 
+    # очищаем возможный старый стоп-флаг
+    if STOP_FLAG_PATH.exists():
+        STOP_FLAG_PATH.unlink(missing_ok=True)
+
     strategy = MomentumStrategy(cfg)
     risk = RiskManager(cfg)
     broker = PaperBrokerClient(Decimal(str(cfg["risk"]["capital_rub"])))
@@ -206,7 +213,7 @@ async def run_paper(cfg: dict) -> None:
         except Exception:
             total_equity = Decimal(str(cfg["risk"]["capital_rub"]))
 
-        capital_cfg = Decimal(str(cfg["risk"]["capital_rub"]))
+        capital_cfg = Decimal(str(cfg["risk"]["capital_rub"]]))
         pnl_total = total_equity - capital_cfg
 
         prices = {t: float(p) for t, p in gui_prices.items()}
@@ -239,6 +246,12 @@ async def run_paper(cfg: dict) -> None:
 
     try:
         async for candle in feed.stream_candles(figis, tf_main):
+            # Проверка стоп-флага от GUI
+            if STOP_FLAG_PATH.exists():
+                logger.warning("Получен стоп-флаг от GUI. Останавливаю paper-loop.")
+                stop_reason = "Остановка через GUI (stop.flag)"
+                break
+
             figi = candle["figi"]
             ticker = ticker_by_figi.get(figi, figi)
             lot = lot_by_figi.get(figi, 1)
@@ -481,6 +494,10 @@ async def run_live(cfg: dict) -> None:
     if TINKOFF_SANDBOX:
         logger.warning("Запущен live-loop в sandbox окружении T-Invest")
 
+    # очищаем возможный старый стоп-флаг
+    if STOP_FLAG_PATH.exists():
+        STOP_FLAG_PATH.unlink(missing_ok=True)
+
     strategy = MomentumStrategy(cfg)
     risk = RiskManager(cfg)
     notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, cfg)
@@ -573,9 +590,15 @@ async def run_live(cfg: dict) -> None:
 
     try:
         async for candle in feed.stream_candles(figis, tf_main):
+            # Проверка стоп-флага от GUI
+            if STOP_FLAG_PATH.exists():
+                logger.warning("Получен стоп-флаг от GUI. Останавливаю %s-loop.", mode_label)
+                stop_reason = "Остановка через GUI (stop.flag)"
+                break
+
             figi = candle["figi"]
             ticker = ticker_by_figi.get(figi, figi)
-            lot = lot_by_figi.get(figi, 1)
+            lot = lot_by_figи.get(figi, 1)
             now_utc = datetime.now(tz=timezone.utc)
 
             candle_buffers[figi].append(candle)
@@ -599,9 +622,9 @@ async def run_live(cfg: dict) -> None:
             gt_counter += 1
             if gt_enabled and gt_counter % gt_refresh_interval == 0:
                 inst = inst_by_ticker.get(ticker, {})
-                global_figi = inst.get("global_figi") or figi
+                global_figи = inst.get("global_figi") or figi
                 df_h = await feed.get_candles(
-                    global_figi, tf_global, now_utc - timedelta(days=5), now_utc
+                    global_figи, tf_global, now_utc - timedelta(days=5), now_utc
                 )
                 trend = compute_global_trend(
                     df_h,
@@ -704,7 +727,7 @@ async def run_live(cfg: dict) -> None:
                     logger.warning("[%s] Риск-блок: %s", ticker, e)
                     continue
 
-                # --- NEW: запрашиваем ГО у Tinkoff API для этого фьючерса ---
+                # Запрашиваем ГО у Tinkoff API для этого фьючерса
                 try:
                     margin_per_lot = await broker.get_futures_margin(figi)
                     logger.info(
