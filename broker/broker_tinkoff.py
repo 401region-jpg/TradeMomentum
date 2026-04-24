@@ -22,7 +22,7 @@ BASE_URL = "https://invest-public-api.tinkoff.ru/rest"
 
 def _q(v: dict) -> Decimal:
     units = int(v.get("units", 0))
-    nano  = int(v.get("nano",  0))
+    nano = int(v.get("nano", 0))
     return Decimal(units) + Decimal(nano) / Decimal("1000000000")
 
 
@@ -39,24 +39,24 @@ class TinkoffBrokerClient(BrokerClient):
         sandbox: bool = True,
         live_confirmed: bool = False,
     ):
-        self._token          = token
-        self._account_id     = account_id
-        self._sandbox        = sandbox
+        self._token = token
+        self._account_id = account_id
+        self._sandbox = sandbox
         self._live_confirmed = live_confirmed
         self._headers = {
             "Authorization": f"Bearer {token}",
-            "Content-Type":  "application/json",
-            "accept":        "application/json",
+            "Content-Type": "application/json",
+            "accept": "application/json",
         }
 
     # ── Защита live ───────────────────────────────────────────────────────────
     def _guard_live(self) -> None:
         if not self._sandbox and not self._live_confirmed:
             raise LiveModeBlockedError(
-                "\n" + "="*60 + "\n"
+                "\n" + "=" * 60 + "\n"
                 "ОБНАРУЖЕН LIVE РЕЖИМ. ОСТАНОВИЛСЯ.\n"
                 "Запустите: python runner.py --mode live --confirm-live\n"
-                + "="*60
+                + "=" * 60
             )
 
     def _svc(self, service: str) -> str:
@@ -74,33 +74,75 @@ class TinkoffBrokerClient(BrokerClient):
             return resp.json()
 
     # ── BrokerClient interface ────────────────────────────────────────────────
+
     async def get_balance(self) -> Decimal:
+        """
+        Сумма валютных остатков (totalAmountCurrencies).
+        Для оценки общего equity лучше использовать get_total_equity().
+        """
         if self._sandbox:
-            data = await self._post("SandboxService", "GetSandboxPortfolio",
-                                    {"accountId": self._account_id})
+            data = await self._post(
+                "SandboxService",
+                "GetSandboxPortfolio",
+                {"accountId": self._account_id},
+            )
         else:
-            data = await self._post("OperationsService", "GetPortfolio",
-                                    {"accountId": self._account_id})
+            data = await self._post(
+                "OperationsService",
+                "GetPortfolio",
+                {"accountId": self._account_id},
+            )
         val = data.get("totalAmountCurrencies", {})
         return _q(val) if isinstance(val, dict) else Decimal("0")
 
+    async def get_total_equity(self) -> Decimal:
+        """
+        Общая стоимость портфеля (equity) по счёту в рублях.
+        Берётся из поля totalAmountPortfolio метода GetPortfolio / GetSandboxPortfolio.
+        """
+        if self._sandbox:
+            data = await self._post(
+                "SandboxService",
+                "GetSandboxPortfolio",
+                {"accountId": self._account_id},
+            )
+        else:
+            data = await self._post(
+                "OperationsService",
+                "GetPortfolio",
+                {"accountId": self._account_id},
+            )
+
+        val = data.get("totalAmountPortfolio")
+        if isinstance(val, dict):
+            return _q(val)
+        return Decimal("0")
+
     async def get_positions(self) -> list[Position]:
         if self._sandbox:
-            data = await self._post("SandboxService", "GetSandboxPositions",
-                                    {"accountId": self._account_id})
+            data = await self._post(
+                "SandboxService",
+                "GetSandboxPositions",
+                {"accountId": self._account_id},
+            )
         else:
-            data = await self._post("OperationsService", "GetPositions",
-                                    {"accountId": self._account_id})
-        positions = []
+            data = await self._post(
+                "OperationsService",
+                "GetPositions",
+                {"accountId": self._account_id},
+            )
+        positions: list[Position] = []
         for f in data.get("futures", []):
             qty = int(f.get("balance", 0))
-            positions.append(Position(
-                instrument_uid = f.get("instrumentUid", ""),
-                ticker         = f.get("instrumentUid", ""),
-                quantity       = qty,
-                avg_price      = Decimal("0"),
-                current_price  = Decimal("0"),
-            ))
+            positions.append(
+                Position(
+                    instrument_uid=f.get("instrumentUid", ""),
+                    ticker=f.get("instrumentUid", ""),
+                    quantity=qty,
+                    avg_price=Decimal("0"),
+                    current_price=Decimal("0"),
+                )
+            )
         return positions
 
     async def place_market_order(
@@ -112,31 +154,46 @@ class TinkoffBrokerClient(BrokerClient):
     ) -> Order:
         self._guard_live()
 
-        order_id  = str(uuid.uuid4())
-        tink_dir  = "ORDER_DIRECTION_BUY" if direction == OrderDirection.BUY else "ORDER_DIRECTION_SELL"
+        order_id = str(uuid.uuid4())
+        tink_dir = (
+            "ORDER_DIRECTION_BUY"
+            if direction == OrderDirection.BUY
+            else "ORDER_DIRECTION_SELL"
+        )
 
-        logger.info("ORDER → %s %s x%d | sandbox=%s", ticker, direction.value, quantity, self._sandbox)
+        logger.info(
+            "ORDER → %s %s x%d | sandbox=%s",
+            ticker,
+            direction.value,
+            quantity,
+            self._sandbox,
+        )
 
         body = {
-            "accountId":    self._account_id,
+            "accountId": self._account_id,
             "instrumentId": instrument_uid,
-            "quantity":     str(quantity),
-            "direction":    tink_dir,
-            "orderType":    "ORDER_TYPE_MARKET",
-            "orderId":      order_id,
+            "quantity": str(quantity),
+            "direction": tink_dir,
+            "orderType": "ORDER_TYPE_MARKET",
+            "orderId": order_id,
         }
 
-        method  = "PostSandboxOrder" if self._sandbox else "PostOrder"
-        service = "SandboxService"   if self._sandbox else "OrdersService"
+        method = "PostSandboxOrder" if self._sandbox else "PostOrder"
+        service = "SandboxService" if self._sandbox else "OrdersService"
 
         try:
             resp = await self._post(service, method, body)
         except Exception as e:
             logger.error("Ошибка ордера: %s", e)
             return Order(
-                uid=order_id, instrument_uid=instrument_uid, ticker=ticker,
-                direction=direction, quantity=quantity, price=None,
-                status=OrderStatus.REJECTED, error_message=str(e),
+                uid=order_id,
+                instrument_uid=instrument_uid,
+                ticker=ticker,
+                direction=direction,
+                quantity=quantity,
+                price=None,
+                status=OrderStatus.REJECTED,
+                error_message=str(e),
             )
 
         filled_price: Optional[Decimal] = None
@@ -149,17 +206,25 @@ class TinkoffBrokerClient(BrokerClient):
 
         return Order(
             uid=resp.get("orderId", order_id),
-            instrument_uid=instrument_uid, ticker=ticker,
-            direction=direction, quantity=quantity, price=None,
-            status=status, filled_price=filled_price,
+            instrument_uid=instrument_uid,
+            ticker=ticker,
+            direction=direction,
+            quantity=quantity,
+            price=None,
+            status=status,
+            filled_price=filled_price,
         )
 
     async def cancel_order(self, order_uid: str) -> bool:
         try:
-            await self._post("OrdersService", "CancelOrder", {
-                "accountId": self._account_id,
-                "orderId":   order_uid,
-            })
+            await self._post(
+                "OrdersService",
+                "CancelOrder",
+                {
+                    "accountId": self._account_id,
+                    "orderId": order_uid,
+                },
+            )
             return True
         except Exception as e:
             logger.error("Ошибка отмены ордера %s: %s", order_uid, e)
