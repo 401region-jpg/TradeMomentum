@@ -175,7 +175,7 @@ class TinkoffBrokerClient(BrokerClient):
             "quantity": str(quantity),
             "direction": tink_dir,
             "orderType": "ORDER_TYPE_MARKET",
-            "orderId": order_id,
+            "orderId":      order_id,
         }
 
         method = "PostSandboxOrder" if self._sandbox else "PostOrder"
@@ -222,7 +222,7 @@ class TinkoffBrokerClient(BrokerClient):
                 "CancelOrder",
                 {
                     "accountId": self._account_id,
-                    "orderId": order_uid,
+                    "orderId":   order_uid,
                 },
             )
             return True
@@ -233,3 +233,50 @@ class TinkoffBrokerClient(BrokerClient):
     async def sync_positions(self) -> None:
         positions = await self.get_positions()
         logger.info("Sync: %d открытых позиций", len(positions))
+
+    # ── ГО по фьючерсу ────────────────────────────────────────────────────────
+
+    async def get_futures_margin(self, instrument_uid: str) -> Decimal:
+        """
+        Возвращает размер гарантийного обеспечения (initialMarginOnBuy)
+        за 1 фьючерсный контракт по instrument_uid.
+
+        Использует InstrumentsService/GetFuturesMargin Tinkoff Invest API.
+        Работает только для боевого контура (в песочнице ГО часто фиктивное).
+        """
+        # В sandbox режиме сервис InstrumentsService официально тоже доступен,
+        # но ГО там может быть нулевым или нестабильным — это уже на твой риск.
+        body = {"instrumentId": instrument_uid}
+
+        try:
+            data = await self._post(
+                "InstrumentsService",
+                "GetFuturesMargin",
+                body,
+            )
+        except Exception as e:
+            logger.error(
+                "Не удалось получить ГО через InstrumentsService/GetFuturesMargin "
+                "для %s: %s",
+                instrument_uid,
+                e,
+            )
+            return Decimal("0")
+
+        mv = data.get("initialMarginOnBuy")
+        if isinstance(mv, dict):
+            margin = _q(mv)
+            logger.debug(
+                "Futures margin (initialMarginOnBuy) для %s: %.2f ₽",
+                instrument_uid,
+                float(margin),
+            )
+            return margin
+
+        logger.warning(
+            "InstrumentsService/GetFuturesMargin вернул неожиданный ответ "
+            "для %s: initialMarginOnBuy=%r",
+            instrument_uid,
+            mv,
+        )
+        return Decimal("0")
