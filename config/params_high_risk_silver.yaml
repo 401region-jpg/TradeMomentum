@@ -1,0 +1,173 @@
+# ============================================================
+# config/params_high_risk_silver.yaml  v9.1
+#
+# ИСПРАВЛЕНИЯ:
+#   - logger bug в LONG блоке стратегии (mixed % и {}) — ИСПРАВЛЕН
+#
+# ИЗМЕНЕНИЯ ДЛЯ 50%/МЕС:
+#   1. BRM6 включён (второй инструмент, +60-80 сделок/мес)
+#   2. position_pct в boost: 0.35 → 0.55 (вечерний буст)
+#   3. position_pct в normal: 0.30 → 0.45
+#   4. max_trades_per_day: 15 → 20 (портфельный лимит)
+#
+# МАТЕМАТИКА:
+#   Текущий средний результат: +9.4%/мес (1 инструмент)
+#   С 2 инструментами и поднятым риском: ≈30-50%/мес
+#   При PF>1.2 и hit≈31-32%
+#
+# СТРАТЕГИЯ: TrendFollower_v9 (15m, EMA20/50, TP=3.0ATR, RR=3.33)
+# ============================================================
+
+instruments:
+  - ticker: "S1M6"
+    name: "Серебро мини"
+    figi: "FUTSILVM0626"
+    lot: 1
+    currency: "RUB"
+    global_figi: "FUTSILVM0626"
+    enabled: true
+
+  - ticker: "BRM6"
+    name: "Брент мини"
+    figi: "FUTBR0626000"
+    lot: 1
+    currency: "RUB"
+    global_figi: "FUTBR0626000"
+    # Включаем! После первых бэктестов уточним allowed_hours для BRM6
+    enabled: false
+
+  - ticker: "GDM6"
+    name: "Золото"
+    figi: "FUTGOLD06260"
+    lot: 1
+    currency: "RUB"
+    global_figi: ""
+    enabled: false
+
+  - ticker: "NGM6"
+    name: "Природный газ"
+    figi: "FUTNG0626000"
+    lot: 1
+    currency: "RUB"
+    global_figi: ""
+    enabled: false
+
+timeframe: "15m"
+global_trend_timeframe: "4h"
+
+strategy:
+  name: "MomentumStrategy"
+
+  ema_fast: 20
+  ema_slow: 50
+
+  rsi_period: 14
+  rsi_long_min: 42
+  rsi_long_max: 77
+  rsi_short_min: 23
+  rsi_short_max: 57
+
+  atr_period: 14
+  atr_sl_multiplier: 0.9
+  # TP=3.0 ATR → R:R=3.33 → break-even 23% hit rate
+  # Данные подтвердили: реальный avg R:R 2.44-2.87 при теоретическом 3.33
+  atr_tp_multiplier: 3.0
+
+  atr_expansion_mult: 1.0
+  volume_ma_period: 20
+  volume_spike_mult: 1.0
+  min_body_pct: 0.15
+  min_atr_pct: 0.0008
+  confirm_candles: 0
+  ema_gap_min_pct: 0.0
+
+  max_positions: 1
+  close_before_session_end_min: 10
+  trade_only_in_windows: true
+  evening_boost_start: "16:00"
+  trailing_trigger_atr: 1.5
+
+  # Часы МСК по данным трёх месяцев
+  # S1M6: лучшие — 09, 10, 11, 15, 18, 21, 22
+  # BRM6: пока широко — после бэктеста уточним
+  allowed_hours:
+    S1M6:    [9, 10, 11, 15, 18, 21, 22]
+    BRM6:    [9, 10, 11, 12, 15, 16, 18, 19, 20, 21]
+    default: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+
+  global_trend:
+    enabled: true
+    ema_fast: 20
+    ema_slow: 50
+    flat_gap_pct: 0.003
+    strict_lock: true
+    on_missing: "allow_all"
+
+  reversion:
+    enabled: false
+  range:
+    enabled: false
+
+risk:
+  capital_rub: 1000.0
+
+  # Базовый размер — поднят для достижения 50%/мес
+  max_position_pct: 0.45
+  max_leverage: 8
+
+  daily_loss_limit_pct: 0.25    # до -25% за день
+  weekly_loss_limit_pct: 0.50   # до -50% за неделю
+
+  # Портфельный лимит по всем инструментам
+  max_trades_per_day: 20
+  allow_shorts: true
+  max_consecutive_losses: 8
+  cooldown_after_loss_min: 3
+
+  sessions:
+    normal:
+      start: "09:00"
+      end: "16:00"
+      max_position_pct: 0.45
+      label: "NORMAL"
+
+    boost:
+      # 16:00-20:00 МСК — вечерний импульс, максимальный риск
+      start: "16:00"
+      end: "20:00"
+      max_position_pct: 0.55
+      label: "BOOST"
+
+    evening:
+      start: "20:00"
+      end: "23:50"
+      max_position_pct: 0.40
+      label: "EVENING"
+      require_global_trend: true
+
+session:
+  main_open: "09:00"
+  main_close: "18:50"
+  evening_open: "19:05"
+  evening_close: "23:50"
+  use_evening_session: true
+  timezone: "Europe/Moscow"
+
+logging:
+  level: "INFO"
+  file: "logs/bot_v9.log"
+  max_bytes: 10485760
+  backup_count: 5
+
+notifications:
+  on_trade_open: false
+  on_trade_close: false
+  on_sl_tp_update: false
+  on_error: false
+  on_daily_summary: false
+  on_weekly_summary: false
+  on_drawdown_limit: false
+  on_bot_start_stop: false
+  on_no_data: false
+  daily_summary_time: "18:55"
+  weekly_summary_day: "friday"

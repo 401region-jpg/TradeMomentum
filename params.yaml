@@ -1,0 +1,97 @@
+# ============================================================
+# config/params.yaml — интрадей, 15m, цель 3-5 сделок в день
+# R:R = 2.5:1 (SL=0.8 ATR, TP=2.0 ATR)
+# Фильтры максимально упрощены по рекомендации Perplexity
+# ============================================================
+
+instruments:
+  - ticker: "S1M6"
+    name: "SILVM-6.26 Серебро мини"
+    figi: "FUTSILVM0626"
+    lot: 1
+    currency: "RUB"
+
+timeframe: "15m"
+
+strategy:
+  name: "MomentumStrategy"
+
+  # Направление тренда — главный и единственный жёсткий фильтр
+  ema_fast: 20
+  ema_slow: 50
+
+  # RSI — мягкий фильтр, не лезем в крайности
+  rsi_period: 14
+  rsi_long_min: 48     # лонг: RSI не слишком низкий
+  rsi_long_max: 72     # лонг: RSI не перекуплен
+  rsi_short_min: 28    # шорт: RSI не перепродан
+  rsi_short_max: 52    # шорт: RSI не слишком высокий
+
+  atr_period: 14
+
+  # R:R = 2.5 : SL=0.8 ATR, TP=2.0 ATR
+  atr_sl_multiplier: 0.8
+  atr_tp_multiplier: 2.0
+
+  # Убраны строгие фильтры — только базовые
+  atr_expansion_mult: 1.0   # отключён (было 1.4-1.5)
+  volume_ma_period: 20
+  volume_spike_mult: 1.0    # отключён (было 2.0-2.5)
+  min_body_pct: 0.12        # было 0.4-0.5, теперь минимальный
+  min_atr_pct: 0.0010       # было 0.004, теперь почти любая волатильность
+
+  # Подтверждающие свечи отключены — сразу входим по сигналу
+  confirm_candles: 0
+
+  # Разрыв EMA — отключён
+  ema_gap_min_pct: 0.0
+
+  max_positions: 1
+  close_before_session_end_min: 10
+  trade_only_in_windows: true
+  evening_boost_start: "16:00"
+
+risk:
+  capital_rub: 1000.0
+  max_position_pct: 0.25
+  max_leverage: 5
+
+  # Дневной лимит: 5% (50 руб при 1000 капитала)
+  daily_loss_limit_pct: 0.05
+  weekly_loss_limit_pct: 0.12
+
+  # Цель 3-5 сделок — даём пространство
+  max_trades_per_day: 6
+
+  allow_shorts: true
+
+  # После 3 убытков подряд — пауза
+  max_consecutive_losses: 3
+  cooldown_after_loss_min: 15
+
+session:
+  main_open: "09:00"
+  main_close: "18:50"
+  evening_open: "19:05"
+  evening_close: "23:40"
+  use_evening_session: true
+  timezone: "Europe/Moscow"
+
+logging:
+  level: "INFO"
+  file: "logs/bot.log"
+  max_bytes: 10485760
+  backup_count: 5
+
+notifications:
+  on_trade_open: false
+  on_trade_close: false
+  on_sl_tp_update: false
+  on_error: false
+  on_daily_summary: false
+  on_weekly_summary: false
+  on_drawdown_limit: false
+  on_bot_start_stop: false
+  on_no_data: false
+  daily_summary_time: "18:55"
+  weekly_summary_day: "friday"

@@ -1,0 +1,345 @@
+"""
+risk/risk_manager.py  v5
+
+Ключевые изменения:
+  - Сессионный риск: normal / boost / evening (разный max_position_pct)
+  - Портфельный счётчик сделок: max_trades_per_day суммарно по всем инструментам
+  - get_session_position_pct() → возвращает pct для текущего времени МСК
+  - Логи показывают: "SESSION=BOOST | position_pct=8.0%"
+"""
+
+from __future__ import annotations
+
+import datetime
+import logging
+from decimal import Decimal
+from typing import Optional
+
+import pytz
+
+logger = logging.getLogger(__name__)
+MSK = pytz.timezone("Europe/Moscow")
+
+MIN_RR = 2.0  # минимально допустимый R:R
+
+
+class RiskViolation(Exception):
+    pass
+
+
+class DailyLimitExceeded(RiskViolation):
+    pass
+
+
+class WeeklyLimitExceeded(RiskViolation):
+    pass
+
+
+class MaxPositionsExceeded(RiskViolation):
+    pass
+
+
+class MaxTradesPerDayExceeded(RiskViolation):
+    pass
+
+
+class ConsecutiveLossLimitExceeded(RiskViolation):
+    pass
+
+
+class CooldownActive(RiskViolation):
+    pass
+
+
+def _parse_time(t: str) -> datetime.time:
+    h, m = t.split(":")
+    return datetime.time(int(h), int(m))
+
+
+class SessionConfig:
+    """Конфиг одной торговой сессии."""
+
+    def __init__(self, d: dict, fallback_pct: float):
+        self.start = _parse_time(d.get("start", "00:00"))
+        self.end = _parse_time(d.get("end", "23:59"))
+        self.position_pct = d.get("max_position_pct", fallback_pct)
+        self.label = d.get("label", "UNKNOWN")
+        self.require_trend = d.get("require_global_trend", False)
+
+
+class RiskManager:
+
+    def __init__(self, cfg: dict):
+        r = cfg["risk"]
+        s = cfg["strategy"]
+
+        self._capital = Decimal(str(r["capital_rub"]))
+        self._default_position_pct = r["max_position_pct"]
+        self._max_leverage = r["max_leverage"]
+        self._daily_loss_limit_pct = r["daily_loss_limit_pct"]
+        self._weekly_loss_limit_pct = r["weekly_loss_limit_pct"]
+        self._max_trades_per_day = r["max_trades_per_day"]  # портфельный лимит
+        self._max_positions = s["max_positions"]
+
+        self._max_consec_losses = r.get("max_consecutive_losses", 999)
+        self._cooldown_min = r.get("cooldown_after_loss_min", 0)
+
+        # Проверка R:R
+        sl = s.get("atr_sl_multiplier", 1.0)
+        tp = s.get("atr_tp_multiplier", 2.0)
+        self._configured_rr = tp / sl if sl > 0 else 0
+        if self._configured_rr < MIN_RR:
+            logger.warning(
+                "⚠️  R:R=%.2f < %.1f (минимум). Скорректируйте atr_sl/tp в params.yaml",
+                self._configured_rr,
+                MIN_RR,
+            )
+        else:
+            logger.info("✅ R:R=%.2f (sl×%.1f / tp×%.1f)", self._configured_rr, sl, tp)
+
+        # Сессионные конфиги
+        ses_cfg = r.get("sessions", {})
+        self._sessions: dict[str, SessionConfig] = {}
+        for key in ("normal", "boost", "evening"):
+            if key in ses_cfg:
+                self._sessions[key] = SessionConfig(ses_cfg[key], self._default_position_pct)
+        if not self._sessions:
+            logger.info("Сессионный риск не настроен — используется базовый position_pct")
+
+        # Состояние (сбрасывается ежедневно)
+        self._day_pnl = Decimal("0")
+        self._week_pnl = Decimal("0")
+        self._portfolio_trades = 0  # суммарно по всем инструментам за день
+        self._consec_losses = 0
+        self._last_loss_time: Optional[datetime.datetime] = None
+
+        _today = datetime.date.today()
+        self._current_date = _today
+        self._current_week = _today.isocalendar()[1]
+
+    # ── Сессионный риск ───────────────────────────────────────────────────────
+
+    def get_session_info(
+        self, dt_utc: Optional[datetime.datetime] = None
+    ) -> tuple[str, float, bool]:
+        """
+        Возвращает (label, position_pct, require_trend) для текущего времени МСК.
+        Если сессионный конфиг не задан — возвращает базовые значения.
+        """
+        if not self._sessions:
+            return "DEFAULT", self._default_position_pct, False
+
+        if dt_utc is None:
+            dt_utc = datetime.datetime.now(datetime.UTC)
+        elif dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=pytz.utc)
+
+        msk_time = dt_utc.astimezone(MSK).time()
+
+        for key in ("boost", "evening", "normal"):  # boost проверяем первым
+            if key not in self._sessions:
+                continue
+            ses = self._sessions[key]
+            if ses.start <= msk_time <= ses.end:
+                return ses.label, ses.position_pct, ses.require_trend
+
+        return "OFF_HOURS", 0.0, False
+
+    # ── Обновление ────────────────────────────────────────────────────────────
+
+    def update_capital(self, c: Decimal) -> None:
+        self._capital = c
+
+    def record_pnl(self, pnl: Decimal) -> None:
+        self._day_pnl += pnl
+        self._week_pnl += pnl
+        self._portfolio_trades += 1
+
+        if pnl < 0:
+            self._consec_losses += 1
+            self._last_loss_time = datetime.datetime.now(datetime.UTC)
+            logger.warning(
+                "📉 Убыток %.2f ₽ | Серия: %d/%d | " "Портфель сделок: %d/%d",
+                float(pnl),
+                self._consec_losses,
+                self._max_consec_losses,
+                self._portfolio_trades,
+                self._max_trades_per_day,
+            )
+        else:
+            self._consec_losses = 0
+            logger.info(
+                "📈 Прибыль %.2f ₽ | Портфель сделок: %d/%d",
+                float(pnl),
+                self._portfolio_trades,
+                self._max_trades_per_day,
+            )
+
+        logger.info(
+            "День: %.2f ₽ | Неделя: %.2f ₽",
+            float(self._day_pnl),
+            float(self._week_pnl),
+        )
+
+    def reset_daily(self) -> None:
+        logger.info(
+            "🔄 Сброс дня. PnL: %.2f ₽ | Сделок: %d", float(self._day_pnl), self._portfolio_trades
+        )
+        self._day_pnl = Decimal("0")
+        self._portfolio_trades = 0
+        self._consec_losses = 0
+        self._last_loss_time = None
+
+    def reset_weekly(self) -> None:
+        logger.info("🔄 Сброс недели. PnL: %.2f ₽", float(self._week_pnl))
+        self._week_pnl = Decimal("0")
+
+    # ── Проверки перед входом ─────────────────────────────────────────────────
+
+    def check_entry_allowed(
+        self,
+        current_positions_count: int,
+        dt_utc: Optional[datetime.datetime] = None,
+    ) -> None:
+        self._check_date_reset()
+        self._check_daily_limit()
+        self._check_weekly_limit()
+        self._check_portfolio_trades()  # портфельный лимит
+        self._check_max_positions(current_positions_count)
+        self._check_consecutive_losses()
+        self._check_cooldown()
+        # Проверяем торговые часы
+        if self._sessions and dt_utc is not None:
+            label, pct, _ = self.get_session_info(dt_utc)
+            if pct <= 0:
+                raise RiskViolation(f"Нет торговой сессии в {label}")
+
+    def _check_daily_limit(self) -> None:
+        limit = self._capital * Decimal(str(self._daily_loss_limit_pct))
+        if self._day_pnl < -limit:
+            raise DailyLimitExceeded(
+                f"Дневной лимит: {float(self._day_pnl):.2f} ₽ " f"(лимит -{float(limit):.2f} ₽)"
+            )
+
+    def _check_weekly_limit(self) -> None:
+        limit = self._capital * Decimal(str(self._weekly_loss_limit_pct))
+        if self._week_pnl < -limit:
+            raise WeeklyLimitExceeded(
+                f"Недельный лимит: {float(self._week_pnl):.2f} ₽ " f"(лимит -{float(limit):.2f} ₽)"
+            )
+
+    def _check_portfolio_trades(self) -> None:
+        if self._portfolio_trades >= self._max_trades_per_day:
+            raise MaxTradesPerDayExceeded(
+                f"Портфельный лимит сделок: {self._portfolio_trades}/" f"{self._max_trades_per_day}"
+            )
+
+    def _check_max_positions(self, count: int) -> None:
+        if count >= self._max_positions:
+            raise MaxPositionsExceeded(f"Лимит позиций: {count}/{self._max_positions}")
+
+    def _check_consecutive_losses(self) -> None:
+        if self._consec_losses >= self._max_consec_losses:
+            raise ConsecutiveLossLimitExceeded(
+                f"Серия убытков: {self._consec_losses}/{self._max_consec_losses}"
+            )
+
+    def _check_cooldown(self) -> None:
+        if self._cooldown_min <= 0 or self._last_loss_time is None:
+            return
+        elapsed = (datetime.datetime.now(datetime.UTC) - self._last_loss_time).total_seconds() / 60
+        if elapsed < self._cooldown_min:
+            raise CooldownActive(f"Кулдаун: ещё {int(self._cooldown_min - elapsed)} мин")
+
+    def _check_date_reset(self) -> None:
+        today = datetime.date.today()
+        week = today.isocalendar()[1]
+        if self._current_date != today:
+            self.reset_daily()
+            self._current_date = today
+        if self._current_week != week:
+            self.reset_weekly()
+            self._current_week = week
+
+    # ── Размер позиции (с учётом сессии) ─────────────────────────────────────
+
+    def calculate_quantity(
+        self,
+        price: Decimal,
+        lot_size: int,
+        sl_distance: Decimal,
+        dt_utc: Optional[datetime.datetime] = None,
+    ) -> int:
+        if sl_distance <= 0 or price <= 0:
+            return 0
+
+        if self._configured_rr < MIN_RR:
+            logger.error("❌ R:R=%.2f < %.1f → вход запрещён", self._configured_rr, MIN_RR)
+            return 0
+
+        # Определяем session position_pct
+        ses_label, ses_pct, _ = self.get_session_info(dt_utc)
+        position_pct = ses_pct if self._sessions else self._default_position_pct
+
+        logger.info(
+            "SESSION=%s | position_pct=%.1f%% | capital=%.2f ₽",
+            ses_label,
+            position_pct * 100,
+            float(self._capital),
+        )
+
+        leverage = Decimal(str(self._max_leverage))
+        max_pos_val = self._capital * Decimal(str(position_pct)) * leverage
+        lots_cap = int(max_pos_val / (price * lot_size))
+
+        risk_budget = self._capital * Decimal(str(position_pct))
+        risk_per_lot = sl_distance * lot_size
+        lots_risk = int(risk_budget / risk_per_lot) if risk_per_lot > 0 else 0
+
+        qty = min(lots_cap, lots_risk)
+
+        if qty <= 0:
+            logger.warning(
+                "qty=0: capital=%.2f price=%.4f sl=%.4f lot=%d ses=%s",
+                float(self._capital),
+                float(price),
+                float(sl_distance),
+                lot_size,
+                ses_label,
+            )
+        else:
+            sl_risk = float(sl_distance) * qty * lot_size
+            tp_goal = sl_risk * self._configured_rr
+            logger.info(
+                "📊 %s | %d лот(ов) @ %.4f | R:R=%.1f | " "SL-риск=%.2f ₽ | TP-цель=%.2f ₽",
+                ses_label,
+                qty,
+                float(price),
+                self._configured_rr,
+                sl_risk,
+                tp_goal,
+            )
+
+        return qty
+
+    # ── Геттеры ───────────────────────────────────────────────────────────────
+
+    @property
+    def day_pnl(self) -> Decimal:
+        return self._day_pnl
+
+    @property
+    def week_pnl(self) -> Decimal:
+        return self._week_pnl
+
+    @property
+    def portfolio_trades(self) -> int:
+        return self._portfolio_trades
+
+    @property
+    def capital(self) -> Decimal:
+        return self._capital
+
+    @property
+    def consecutive_losses(self) -> int:
+        return self._consec_losses

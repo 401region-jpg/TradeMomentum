@@ -1,0 +1,8 @@
+httpx
+python-dotenv
+python-telegram-bot
+pandas
+numpy
+pyyaml
+pytest
+pytest-asyncio
