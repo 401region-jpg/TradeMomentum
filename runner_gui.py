@@ -479,7 +479,7 @@ async def run_live(cfg: dict, dry_run: bool = False) -> None:
     from strategy.base import SignalType
     from strategy.momentum import MomentumStrategy, compute_global_trend
 
-    mode_label = "LIVE-DRYRUN" if dry_run else "LIVE"
+    mode_label = "LIVE"
     logger.warning("=== %s EXECUTION LOOP (GUI) ===", mode_label)
     if TINKOFF_SANDBOX:
         logger.warning("Запущен live-loop в sandbox окружении T-Invest")
@@ -489,10 +489,10 @@ async def run_live(cfg: dict, dry_run: bool = False) -> None:
     notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, cfg)
     feed = DataFeed(TINKOFF_API_TOKEN, TINKOFF_SANDBOX)
     broker = TinkoffBrokerClient(
-        token=TINKOFF_API_TOKEN,
-        account_id=TINKOFF_ACCOUNT_ID,
-        sandbox=TINKOFF_SANDBOX,
-        live_confirmed=not dry_run,
+    token=TINKOFF_API_TOKEN,
+    account_id=TINKOFF_ACCOUNT_ID,
+    sandbox=TINKOFF_SANDBOX,
+    live_confirmed=True,  # GUI live всегда с явным подтверждением через кнопку
     )
 
     tf_main = cfg["timeframe"]
@@ -556,7 +556,7 @@ async def run_live(cfg: dict, dry_run: bool = False) -> None:
         prices = {t: float(p) for t, p in gui_prices.items()}
 
         state = {
-            "mode": "live-dry-run" if dry_run else "live",
+            "mode": "live",
             "reason": reason,
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             "equity": float(total_equity) if total_equity is not None else None,
@@ -643,19 +643,16 @@ async def run_live(cfg: dict, dry_run: bool = False) -> None:
                         OrderDirection.SELL if pos["side"] == "long" else OrderDirection.BUY
                     )
 
-                    if dry_run:
-                        logger.info(
-                            "[DRY-RUN] CLOSE %s %s x%d | reason=%s @ %.4f",
-                            ticker,
-                            exit_direction.value,
-                            qty_to_close,
-                            close_reason,
-                            float(close_price),
-                        )
-                    else:
-                        await broker.place_market_order(
-                            figi, ticker, exit_direction, qty_to_close
-                        )
+                    exit_direction = (
+    OrderDirection.SELL if pos["side"] == "long" else OrderDirection.BUY
+    )
+
+    await broker.place_market_order(
+        figi,
+        ticker,
+        exit_direction,
+        qty_to_close,
+    )
 
                     pnl = (close_price - pos["entry_price"]) * Decimal(
                         qty_to_close if pos["side"] == "long" else -qty_to_close
@@ -715,21 +712,11 @@ async def run_live(cfg: dict, dry_run: bool = False) -> None:
                     OrderDirection.BUY if sig.type == SignalType.LONG else OrderDirection.SELL
                 )
 
-                if dry_run:
-                    logger.info(
-                        "[DRY-RUN] OPEN %s %s x%d @ %.4f",
-                        ticker,
-                        direction.value,
-                        qty,
-                        float(price),
-                    )
-                    entry_price = price
-                else:
-                    order = await broker.place_market_order(figi, ticker, direction, qty)
-                    if order.status.value == "rejected":
-                        logger.error("[%s] Ордер отклонён: %s", ticker, order.error_message)
-                        continue
-                    entry_price = order.filled_price or price
+                order = await broker.place_market_order(figi, ticker, direction, qty)
+    if order.status.value == "rejected":
+    logger.error("[%s] Ордер отклонён: %s", ticker, order.error_message)
+    continue
+    entry_price = order.filled_price or price
 
                 live_positions[ticker] = {
                     "side": "long" if sig.type == SignalType.LONG else "short",
@@ -802,11 +789,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Явно подтвердить запуск live-режима",
     )
-    p.add_argument(
-        "--live-dry-run",
-        action="store_true",
-        help="Запустить live execution loop без отправки реальных ордеров",
-    )
     return p.parse_args()
 
 
@@ -818,19 +800,16 @@ async def main() -> None:
     logger.info("GUI Runner | Режим: %s | Конфиг: %s", args.mode.upper(), args.config)
 
     try:
-        if args.mode == "paper":
-            await run_paper(cfg)
-        elif args.mode == "live":
-            if not args.confirm_live:
-                logger.critical(
-                    "⛔ LIVE требует --confirm-live. "
-                    "Для безопасной проверки используйте --live-dry-run."
-                )
-                sys.exit(1)
-            await run_live(cfg, dry_run=args.live_dry_run)
-    except Exception:
-        logger.exception("Необработанная ошибка в runner_gui.main()")
-        raise
+if args.mode == "paper":
+    await run_paper(cfg)
+elif args.mode == "live":
+    if not args.confirm_live:
+        logger.critical(
+            "⛔ LIVE требует --confirm-live. "
+            "Запустите через GUI 'Live' или добавьте --confirm-live."
+        )
+        sys.exit(1)
+    await run_live(cfg)
 
 
 if __name__ == "__main__":
