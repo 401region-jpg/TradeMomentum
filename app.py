@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 import flet as ft
 import yaml
 import pandas as pd
-
+import psutil  # добавили для проверки PID
 
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config" / "params.yaml"
@@ -45,6 +45,36 @@ def load_state() -> dict:
             return json.load(f)
     except Exception:
         return {}
+
+
+def save_state(state: dict) -> None:
+    """Записываем bot_state.json (используем для runner_pid и пр.)."""
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def clear_runner_pid_in_state() -> None:
+    """Обнуляем runner_pid в bot_state.json (не трогая остальное)."""
+    state = load_state()
+    if "runner_pid" in state:
+        state["runner_pid"] = None
+        state["status"] = "stopped"
+        save_state(state)
+
+
+def is_pid_running(pid: int) -> bool:
+    """Проверяем, жив ли процесс с таким PID (через psutil)."""
+    try:
+        p = psutil.Process(pid)
+        return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+    except Exception:
+        return False
 
 
 def load_last_trades() -> pd.DataFrame:
@@ -305,6 +335,21 @@ def main(page: ft.Page):
             except Exception:
                 pass
 
+        # 1) Проверяем по bot_state.json, не жив ли уже другой раннер
+        st = load_state()
+        existing_pid = st.get("runner_pid")
+        if isinstance(existing_pid, int) and existing_pid > 0:
+            if is_pid_running(existing_pid):
+                status.value = f"Бот уже запущен (PID={existing_pid}), новый не стартуем"
+                page.update()
+                return
+            else:
+                # старый PID мёртвый — можно очистить
+                st["runner_pid"] = None
+                st["status"] = "stopped"
+                save_state(st)
+
+        # 2) Локальный subprocess в рамках этого GUI
         if runner_process and runner_process.poll() is None:
             status.value = f"Уже запущен PID={runner_process.pid}"
             page.update()
@@ -322,6 +367,12 @@ def main(page: ft.Page):
                 env=env,
                 creationflags=creationflags,
             )
+            # 3) Записываем PID в bot_state.json
+            st = load_state()
+            st["runner_pid"] = runner_process.pid
+            st["status"] = "running"
+            save_state(st)
+
             status.value = f"{label} стартовал, PID={runner_process.pid}"
         except Exception as e:
             status.value = f"Ошибка запуска: {e}"
@@ -342,6 +393,20 @@ def main(page: ft.Page):
             except Exception:
                 pass
 
+        # 1) Проверка bot_state.json на живой PID
+        st = load_state()
+        existing_pid = st.get("runner_pid")
+        if isinstance(existing_pid, int) and existing_pid > 0:
+            if is_pid_running(existing_pid):
+                status.value = f"Бот уже запущен (PID={existing_pid}), новый LIVE не стартуем"
+                page.update()
+                return
+            else:
+                st["runner_pid"] = None
+                st["status"] = "stopped"
+                save_state(st)
+
+        # 2) Проверка локального runner_process
         if runner_process and runner_process.poll() is None:
             status.value = f"Уже запущен PID={runner_process.pid}"
             page.update()
@@ -363,6 +428,11 @@ def main(page: ft.Page):
                 env=env,
                 creationflags=creationflags,
             )
+            st = load_state()
+            st["runner_pid"] = runner_process.pid
+            st["status"] = "running"
+            save_state(st)
+
             status.value = f"LIVE стартовал, PID={runner_process.pid}"
         except Exception as e:
             status.value = f"Ошибка запуска LIVE: {e}"
@@ -380,14 +450,31 @@ def main(page: ft.Page):
             pass
 
         # дополнительно убиваем subprocess, если он ещё жив
+        killed_pid = None
         if runner_process and runner_process.poll() is None:
             try:
+                killed_pid = runner_process.pid
                 runner_process.terminate()
-                status.value = "Runner остановлен (STOP-флаг + terminate)"
+                status.value = f"Runner остановлен (STOP-флаг + terminate), PID={killed_pid}"
             except Exception as ex:
                 status.value = f"Ошибка остановки runner: {ex}"
         else:
-            status.value = "Runner не запущен (STOP-флаг записан)"
+            # возможно, раннер был запущен из другого места (по PID из state)
+            st = load_state()
+            existing_pid = st.get("runner_pid")
+            if isinstance(existing_pid, int) and existing_pid > 0 and is_pid_running(existing_pid):
+                try:
+                    p = psutil.Process(existing_pid)
+                    p.terminate()
+                    killed_pid = existing_pid
+                    status.value = f"Runner по PID={existing_pid} остановлен через psutil"
+                except Exception as ex:
+                    status.value = f"Не удалось остановить PID={existing_pid}: {ex}"
+            else:
+                status.value = "Runner не запущен (STOP-флаг записан)"
+
+        # в любом случае чистим PID в state
+        clear_runner_pid_in_state()
         page.update()
 
     def on_refresh(e=None):
