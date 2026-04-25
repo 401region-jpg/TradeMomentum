@@ -4,7 +4,9 @@ runner_gui.py — упрощённый раннер под GUI (paper + live)
 Использует те же модули, что runner.py, но:
 - добавляет online-лог trades/live_log.csv;
 - гарантированно и часто обновляет state/bot_state.json для GUI;
-- добавляет детальное логирование открытий/закрытий для отладки SL/TP.
+- восстанавливает состояние позиций при рестарте;
+- добавляет детальное логирование открытий/закрытий для отладки SL/TP;
+- добавляет метрики (PnL%, дистанция) в state.
 """
 
 from __future__ import annotations
@@ -339,15 +341,47 @@ async def run_paper(cfg: dict) -> None:
         state_positions = []
         for p in positions:
             meta = entry_levels.get(p.ticker, {})
+            
+            # GUI Metrics calculation
+            entry_price = Decimal(str(meta.get("entry_price", p.avg_price)))
+            sl_price = Decimal(str(meta.get("sl", 0)))
+            tp_price = Decimal(str(meta.get("tp", 0)))
+            last_price = gui_prices.get(p.ticker)
+            side = meta.get("side", "")
+            
+            pnl_pct = None
+            dist_to_tp_pct = None
+            dist_to_sl_pct = None
+
+            if last_price is not None and entry_price > 0:
+                last_price_dec = Decimal(str(last_price))
+                if side == "long":
+                    move = last_price_dec - entry_price
+                else:
+                    move = entry_price - last_price_dec
+                
+                pnl_pct = float((move / entry_price) * Decimal("100"))
+
+                if tp_price != 0:
+                    dist_tp = (tp_price - last_price_dec) if side == "long" else (last_price_dec - tp_price)
+                    dist_to_tp_pct = float((dist_tp / entry_price) * Decimal("100"))
+                
+                if sl_price != 0:
+                    dist_sl = (last_price_dec - sl_price) if side == "long" else (sl_price - last_price_dec)
+                    dist_to_sl_pct = float((dist_sl / entry_price) * Decimal("100"))
+
             state_positions.append(
                 {
                     "ticker": p.ticker,
-                    "side": meta.get("side", ""),
+                    "side": side,
                     "qty": float(p.quantity),
-                    "entry_price": float(meta.get("entry_price", p.avg_price)),
-                    "sl": float(meta.get("sl", 0)) if meta.get("sl") is not None else None,
-                    "tp": float(meta.get("tp", 0)) if meta.get("tp") is not None else None,
+                    "entry_price": float(entry_price),
+                    "sl": float(sl_price) if sl_price is not None else None,
+                    "tp": float(tp_price) if tp_price is not None else None,
                     "entry_time": meta.get("entry_time", ""),
+                    "pnl_pct": pnl_pct,
+                    "dist_to_tp_pct": dist_to_tp_pct,
+                    "dist_to_sl_pct": dist_to_sl_pct,
                 }
             )
 
@@ -470,6 +504,16 @@ async def run_paper(cfg: dict) -> None:
                         float(Decimal(str(candle["low"]))),
                         float(Decimal(str(candle["high"]))),
                     )
+                    
+                    # Wick Monitoring
+                    if close_reason == "sl":
+                        logger.info(
+                            "[%s] PAPER Wick Monitor (SL Hit) | sl=%.4f low=%.4f close=%.4f",
+                            ticker,
+                            float(sl_price),
+                            float(Decimal(str(candle["low"]))),
+                            float(Decimal(str(candle["close"]))),
+                        )
 
                     await broker.place_market_order(
                         figi, ticker, exit_direction, qty_to_close, execution_price=close_price
@@ -673,6 +717,42 @@ async def run_live(cfg: dict) -> None:
         live_confirmed=True,  # GUI live всегда с явным подтверждением через кнопку
     )
 
+    # --- LIVE: Восстановление позиций при старте ---
+    live_positions: dict[str, dict] = {}
+    
+    try:
+        open_positions = await broker.get_positions()
+    except Exception as e:
+        logger.warning("[LIVE] Не удалось получить текущие позиции при старте: %s", e)
+        open_positions = []
+
+    now_utc = datetime.now(tz=timezone.utc)
+
+    for p in open_positions:
+        ticker = p.ticker
+        qty = int(p.quantity)
+        if qty == 0:
+            continue
+
+        # Восстанавливаем только факт наличия позиции.
+        # SL/TP теряются, так как хранятся только в памяти бота.
+        live_positions[ticker] = {
+            "side": "long" if qty > 0 else "short",
+            "qty": abs(qty),
+            "entry_price": Decimal(str(p.avg_price)),
+            "sl": Decimal("0"),  # SL/TP неизвестны
+            "tp": Decimal("0"),  # SL/TP неизвестны
+            "entry_time": now_utc.isoformat(),
+            "entry_candle_time": None,
+        }
+
+    if live_positions:
+        logger.warning(
+            "[LIVE] Восстановлены открытые позиции при старте: %s. "
+            "ВНИМАНИЕ: Уровни SL/TP сброшены, так как не сохранялись в бирже.",
+            {t: dict(side=v["side"], qty=v["qty"], entry_price=str(v["entry_price"])) for t, v in live_positions.items()},
+        )
+
     # --- LIVE: синхронизируем капитал с реальным счётом ---
     try:
         real_equity = await broker.get_total_equity()
@@ -717,7 +797,7 @@ async def run_live(cfg: dict) -> None:
         return
 
     candle_buffers: dict[str, list] = {f: [] for f in figis}
-    live_positions: dict[str, dict] = {}
+    # live_positions уже инициализирован выше, здесь не дублируем
     gui_prices: dict[str, Decimal] = {}
 
     logger.info("[%s] Прогрев (3 дня)...", mode_label)
@@ -745,15 +825,46 @@ async def run_live(cfg: dict) -> None:
         positions_view = []
 
         for ticker, pos in live_positions.items():
+            entry_price = Decimal(str(pos["entry_price"]))
+            sl = Decimal(str(pos["sl"]))
+            tp = Decimal(str(pos["tp"]))
+            last_price = gui_prices.get(ticker)
+
+            pnl_pct = None
+            dist_to_tp_pct = None
+            dist_to_sl_pct = None
+
+            if last_price is not None and entry_price > 0:
+                last_price_dec = Decimal(str(last_price))
+                
+                # Расчет PnL % в зависимости от стороны
+                if pos["side"] == "long":
+                    move = last_price_dec - entry_price
+                else:
+                    move = entry_price - last_price_dec
+                
+                pnl_pct = float((move / entry_price) * Decimal("100"))
+
+                if tp != 0:
+                    dist_tp = (tp - last_price_dec) if pos["side"] == "long" else (last_price_dec - tp)
+                    dist_to_tp_pct = float((dist_tp / entry_price) * Decimal("100"))
+                
+                if sl != 0:
+                    dist_sl = (last_price_dec - sl) if pos["side"] == "long" else (sl - last_price_dec)
+                    dist_to_sl_pct = float((dist_sl / entry_price) * Decimal("100"))
+
             positions_view.append(
                 {
                     "ticker": ticker,
                     "side": pos["side"],
                     "qty": float(pos["qty"]),
-                    "entry_price": float(pos["entry_price"]),
-                    "sl": float(pos["sl"]),
-                    "tp": float(pos["tp"]),
+                    "entry_price": float(entry_price),
+                    "sl": float(sl),
+                    "tp": float(tp),
                     "entry_time": pos.get("entry_time", ""),
+                    "pnl_pct": pnl_pct,
+                    "dist_to_tp_pct": dist_to_tp_pct,
+                    "dist_to_sl_pct": dist_to_sl_pct,
                 }
             )
 
@@ -873,6 +984,16 @@ async def run_live(cfg: dict) -> None:
                         float(Decimal(str(candle["low"]))),
                         float(Decimal(str(candle["high"]))),
                     )
+
+                    # Wick Monitoring
+                    if close_reason == "sl":
+                        logger.info(
+                            "[%s] LIVE Wick Monitor (SL Hit) | sl=%.4f low=%.4f close=%.4f",
+                            ticker,
+                            float(pos["sl"]),
+                            float(Decimal(str(candle["low"]))),
+                            float(Decimal(str(candle["close"]))),
+                        )
 
                     await broker.place_market_order(
                         figi,
