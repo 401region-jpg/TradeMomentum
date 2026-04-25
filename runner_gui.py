@@ -423,6 +423,13 @@ async def run_paper(cfg: dict) -> None:
             # проверка SL/TP
             if current_pos and ticker in entry_levels:
                 meta = entry_levels[ticker]
+
+                # защита от "вход и выход в одной свече"
+                entry_candle_time = meta.get("entry_candle_time")
+                if entry_candle_time and candle.get("time") == entry_candle_time:
+                    await snapshot_paper_state(reason="same_candle_skip_sl_tp")
+                    continue
+
                 side = meta["side"]
                 sl_price = meta["sl"]
                 tp_price = meta["tp"]
@@ -545,6 +552,7 @@ async def run_paper(cfg: dict) -> None:
                         "sl": sig.sl_price,
                         "tp": sig.tp_price,
                         "entry_time": now_utc.isoformat(),
+                        "entry_candle_time": candle.get("time") or candle.get("ts"),
                     }
 
                     await notifier.notify_trade_open(
@@ -746,12 +754,12 @@ async def run_live(cfg: dict) -> None:
 
             figi = candle["figi"]
             ticker = ticker_by_figi.get(figi, figi)
-            lot = lot_by_figи.get(figi, 1)
+            lot = lot_by_figi.get(figi, 1)
             now_utc = datetime.now(tz=timezone.utc)
 
             candle_buffers[figi].append(candle)
-            if len(candle_buffers[figи]) > 500:
-                candle_buffers[figи] = candle_buffers[figи][-500:]
+            if len(candle_buffers[figi]) > 500:
+                candle_buffers[figi] = candle_buffers[figi][-500:]
 
             price_dec = Decimal(str(candle["close"]))
             gui_prices[ticker] = price_dec
@@ -797,6 +805,13 @@ async def run_live(cfg: dict) -> None:
             # SL/TP по уже открытым позициям
             if ticker in live_positions:
                 pos = live_positions[ticker]
+
+                # защита от "вход и выход в одной свече"
+                entry_candle_time = pos.get("entry_candle_time")
+                if entry_candle_time and candle.get("time") == entry_candle_time:
+                    await snapshot_live_state(reason="same_candle_skip_sl_tp")
+                    continue
+
                 close_reason: Optional[str] = None
                 close_price: Optional[Decimal] = None
 
@@ -930,6 +945,7 @@ async def run_live(cfg: dict) -> None:
                     "sl": sig.sl_price,
                     "tp": sig.tp_price,
                     "entry_time": now_utc.isoformat(),
+                    "entry_candle_time": candle.get("time") or candle.get("ts"),
                 }
 
                 await notifier.notify_trade_open(
