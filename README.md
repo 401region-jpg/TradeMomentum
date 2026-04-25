@@ -1,190 +1,488 @@
-# Trading Bot для Т‑Инвест
+## Trading Bot (GUI + CLI)
 
-Алгоритмический торговый бот для фьючерсов MOEX (Si, Brent, Silver и др.)
-через официальный T‑Invest API. Стратегия: EMA Cross + RSI-фильтр + ATR-стопы.
+## 
 
----
+## Автоматизированный торговый бот для фьючерсного рынка (T-Invest API), с поддержкой бэктеста, paper-торговли и графического интерфейса (GUI).
+
+## 
 
 ## ⚠️ КРИТИЧЕСКИЕ ПРАВИЛА
 
-1. **Никогда** не запускается в live без явного флага `--confirm-live`
-2. Всегда начинайте с `backtest` → `paper` → только потом `live`
-3. `.env` **никогда** не коммитится в git
-4. Реальные токены из `.env` **никогда** не публикуются
+## &#x20;  Никогда не запускайте в режиме `live` без явного флага `--confirm-live` (CLI) или кнопки подтверждения в GUI.
 
----
+## &#x20;  Обязательный порядок: `backtest` → `paper` → `live`.
 
-## Структура проекта
+## &#x20;  Файл `.env` никогда не коммитится в git.
 
-```
-trading-bot/
-├── config/
-│   ├── params.yaml          ← ВСЕ параметры стратегии и риска
-│   └── settings.py          ← читает .env
-├── data/
-│   └── data_feed.py         ← исторические и потоковые котировки
-├── strategy/
-│   ├── base.py              ← абстрактный интерфейс Strategy
-│   └── multi_signal.py      ← EMA Cross + RSI + ATR
-├── risk/
-│   └── risk_manager.py      ← все лимиты, размер позиции
-├── broker/
-│   ├── base.py              ← абстрактный BrokerClient
-│   ├── broker_tinkoff.py    ← адаптер T-Invest API
-│   └── broker_paper.py      ← paper-симулятор (без реальных ордеров)
-├── notifications/
-│   └── notifier_telegram.py ← все типы уведомлений
-├── backtest/
-│   ├── backtester.py        ← движок бэктеста (без API)
-│   └── metrics.py           ← Sharpe, Sortino, PF, DD и др.
-├── tests/
-│   ├── conftest.py
-│   ├── test_strategy.py
-│   ├── test_risk_manager.py
-│   └── test_backtester.py
-├── scripts/
-│   ├── get_account_id.py    ← получить Account ID
-│   ├── get_chat_id.py       ← получить Telegram chat_id
-│   └── fund_sandbox.py      ← пополнить sandbox-счёт
-├── runner.py                ← точка входа
-├── requirements.txt
-├── .env.example
-└── .gitignore
-```
+## &#x20;  Реальные токены из `.env` никогда не публикуются.
 
----
+## 
 
-## Быстрый старт
+## \---
 
-### 1. Клонирование и зависимости
+## 
 
-```bash
-git clone <ваш-репо>
-cd trading-bot
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
+## &#x20;Структура проекта
 
-### 2. Настройка .env
+## ```
 
-```bash
-cp .env.example .env
-# Откройте .env и заполните токены (см. инструкции ниже)
-```
+## trading-bot/
 
-### 3. Получение Account ID
+## ├── config/
 
-```bash
-python scripts/get_account_id.py
-# Скопируйте ID в .env → TINKOFF_ACCOUNT_ID=...
-```
+## │   ├── params.yaml          ← ВСЕ параметры стратегии и риска
 
-### 4. Получение Telegram chat_id
+## │   └── settings.py          ← читает .env
 
-```bash
-python scripts/get_chat_id.py
-# Напишите боту в Telegram → получите chat_id → скопируйте в .env
-```
+## ├── data/
 
-### 5. Поиск FIGI инструментов
+## │   └── data\_feed.py         ← исторические и потоковые котировки
 
-```bash
-python runner.py --find-figi SiM6
-python runner.py --find-figi BRM6
-python runner.py --find-figi SVM6
-# Вставьте FIGI в config/params.yaml
-```
+## ├── strategy/
 
----
+## │   ├── base.py              ← абстрактный интерфейс Strategy
 
-## Режимы запуска
+## │   └── momentum.py         ← стратегия на импульсе и глобальном тренде
 
-### Backtest (на исторических данных, без API-ордеров)
+## ├── risk/
 
-```bash
-python runner.py --mode backtest
-```
+## │   ├── risk\_manager.py      ← лимиты, размер позиции, ГО
 
-- Загружает 180 дней исторических свечей через T-Invest API
-- Прогоняет стратегию, считает PnL, метрики, equity-кривую
-- Сохраняет сделки в `trades/backtest_*.csv`
-- **Не отправляет ордеров**
+## │   └── contracts.py        ← спецификации фьючерсов (min step, size)
 
-### Paper Trading (реальные котировки, симулированные ордера)
+## ├── broker/
 
-```bash
-python runner.py --mode paper
-```
+## │   ├── base.py              ← абстрактный BrokerClient
 
-- Подписывается на живой поток котировок
-- Моделирует сделки в памяти без реальных ордеров
-- Отправляет уведомления в Telegram
-- Сохраняет лог сделок в `trades/paper_*.csv`
+## │   ├── broker\_tinkoff.py    ← адаптер T-Invest API
 
-### Live Trading (только после успешного paper-этапа)
+## │   └── broker\_paper.py      ← paper-симулятор
 
-```bash
-# ⛔ ТОЛЬКО ПОСЛЕ ЯВНОГО РЕШЕНИЯ
-# Сначала измените TINKOFF_SANDBOX=false в .env
-python runner.py --mode live --confirm-live
-```
+## ├── notifications/
 
----
+## │   └── notifier\_telegram.py ← уведомления в Telegram
 
-## Конфигурация (config/params.yaml)
+## ├── backtest/
 
-Все числовые параметры — только здесь:
+## │   ├── backtester.py        ← движок бэктеста
 
-```yaml
-risk:
-  capital_rub: 1000.0          # ваш капитал
-  max_position_pct: 0.30       # макс. 30% на позицию
-  max_leverage: 5              # плечо
-  daily_loss_limit_pct: 0.05   # стоп-день при -5%
-  weekly_loss_limit_pct: 0.10  # стоп-неделя при -10%
-  max_trades_per_day: 10
+## │   └── metrics.py           ← Sharpe, Sortino, PF
 
-strategy:
-  ema_fast: 20
-  ema_slow: 50
-  rsi_period: 14
-  atr_sl_multiplier: 1.5       # SL = 1.5 * ATR
-  atr_tp_multiplier: 3.0       # TP = 3.0 * ATR → R:R = 2
-```
+## ├── state/
 
----
+## │   └── bot\_state.json       ← состояние бота для GUI (авто-создается)
 
-## Тесты
+## ├── trades/
 
-```bash
-pytest tests/ -v
-```
+## │   └── live\_log.csv         ← онлайн-лог сделок
 
-Тесты запускаются **без** подключения к T-Invest API — только синтетические данные.
+## ├── tests/                   ← юнит-тесты (без API)
 
----
+## ├── scripts/                 ← утилиты (ID аккаунта, Chat ID)
 
-## Добавление новой стратегии
+## ├── runner.py                ← CLI runner (Backtest / поиск FIGI)
 
-1. Создайте `strategy/my_strategy.py`, унаследуйте `Strategy`
-2. Реализуйте `generate_signals()` и `add_indicators()`
-3. В `runner.py` замените `MultiSignalStrategy` на вашу
-4. Добавьте параметры в `config/params.yaml`
+## ├── runner\_gui.py            ← GUI runner (Paper / Live цикл)
 
----
+## ├── app.py                   ← Flask/Dash GUI (веб-интерфейс)
 
-## Добавление нового брокера
+## ├── requirements.txt
 
-1. Создайте `broker/broker_new.py`, унаследуйте `BrokerClient`
-2. Реализуйте все абстрактные методы
-3. Подключите в `runner.py`
+## ├── .env.example
 
----
+## └── .gitignore
 
-## Важные предупреждения
+## ```
 
-- **С капиталом 1000 ₽ невозможно торговать фьючерсами** (ГО ≥ 5000 ₽ за контракт)
-- Бот корректно считает размер позиции и вернёт `qty=0` — ордер не будет выставлен
-- Рекомендуемый минимум для реальной торговли: **50 000–100 000 ₽**
-- Всегда начинайте с sandbox и paper-режима перед live
+## 
+
+## \---
+
+## 
+
+## &#x20;Быстрый старт
+
+## 
+
+## &#x20;1. Клонирование и зависимости
+
+## ```bash
+
+## git clone <ваш-репо>
+
+## cd trading-bot
+
+## python -m venv .venv
+
+## source .venv/bin/activate         Windows: .venv\\Scripts\\activate
+
+## pip install -r requirements.txt
+
+## ```
+
+## 
+
+## &#x20;2. Настройка .env
+
+## ```bash
+
+## cp .env.example .env
+
+## &#x20;Откройте .env и заполните токены
+
+## ```
+
+## 
+
+## &#x20;3. Получение Account ID
+
+## ```bash
+
+## python scripts/get\_account\_id.py
+
+## &#x20;Скопируйте ID в .env → TINKOFF\_ACCOUNT\_ID=...
+
+## ```
+
+## 
+
+## &#x20;4. Получение Telegram chat\_id
+
+## ```bash
+
+## python scripts/get\_chat\_id.py
+
+## &#x20;Напишите боту → получите chat\_id → скопируйте в .env
+
+## ```
+
+## 
+
+## &#x20;5. Поиск FIGI инструментов
+
+## ```bash
+
+## python runner.py --find-figi SiM6
+
+## python runner.py --find-figi BRM6
+
+## &#x20;Вставьте FIGI в config/params.yaml
+
+## ```
+
+## 
+
+## \---
+
+## 
+
+## &#x20;Режимы запуска
+
+## 
+
+## &#x20;1. Backtest (CLI)
+
+## Запуск на исторических данных без подключения к бирже.
+
+## ```bash
+
+## python runner.py --mode backtest
+
+## ```
+
+## &#x20;  Загружает 180 дней истории.
+
+## &#x20;  Считает PnL, Sharpe, Drawdown.
+
+## &#x20;  Сохраняет отчет в `trades/backtest\_.csv`.
+
+## 
+
+## &#x20;2. Paper Trading (GUI / CLI)
+
+## Симуляция торговли на реальных котировках. Рекомендуется перед LIVE.
+
+## 
+
+## Вариант через GUI (рекомендуется):
+
+## ```bash
+
+## python app.py
+
+## &#x20;Откройте браузер → http://localhost:8050 → Нажмите "Start Paper"
+
+## ```
+
+## 
+
+## Вариант через CLI:
+
+## ```bash
+
+## python runner\_gui.py --mode paper
+
+## ```
+
+## &#x20;  Моделирует сделки в памяти.
+
+## &#x20;  Пишет логи в `trades/live\_log.csv`.
+
+## &#x20;  Обновляет `state/bot\_state.json` для мониторинга.
+
+## 
+
+## &#x20;3. Live Trading (Только после Paper)
+
+## ⛔ ОСТОРОЖНО: РЕАЛЬНЫЕ ДЕНЬГИ
+
+## 
+
+## Вариант через GUI (рекомендуется):
+
+## ```bash
+
+## python app.py
+
+## &#x20;В .env установите TINKOFF\_SANDBOX=false
+
+## &#x20;В GUI нажмите "Start Live" и подтвердите действие
+
+## ```
+
+## 
+
+## Вариант через CLI:
+
+## ```bash
+
+## &#x20;В .env установите TINKOFF\_SANDBOX=false
+
+## python runner\_gui.py --mode live --confirm-live
+
+## ```
+
+## 
+
+## \---
+
+## 
+
+## &#x20;🆕 Работа с GUI и Состоянием
+
+## 
+
+## &#x20;`state/bot\_state.json`
+
+## Это сердце связки "Bot ←→ GUI". Бот пишет сюда состояние каждую секунду, GUI читает для отрисовки.
+
+## 
+
+## Структура файла:
+
+## ```json
+
+## {
+
+## &#x20; "mode": "live",
+
+## &#x20; "equity": 150000.50,
+
+## &#x20; "prices": { "SBRF": 15200.0 },
+
+## &#x20; "positions": \[
+
+## &#x20;   {
+
+## &#x20;     "ticker": "SBRF",
+
+## &#x20;     "side": "long",
+
+## &#x20;     "qty": 10,
+
+## &#x20;     "entry\_price": 15100.0,
+
+## &#x20;     "sl": 15000.0,
+
+## &#x20;     "tp": 15400.0,
+
+## &#x20;     "entry\_time": "...",
+
+## &#x20;     
+
+## &#x20;     // Метрики для GUI
+
+## &#x20;     "pnl\_pct": 0.66,             // Текущая прибыль в %
+
+## &#x20;     "dist\_to\_tp\_pct": 1.32,      // До тейка в %
+
+## &#x20;     "dist\_to\_sl\_pct": -0.66      // До стопа в %
+
+## &#x20;   }
+
+## &#x20; ]
+
+## }
+
+## ```
+
+## 
+
+## &#x20;Метрики в GUI
+
+## &#x20;  PnL %: Рассчитывается в реальном времени относительно цены входа.
+
+## &#x20;  Dist to TP/SL %: Показывает, сколько процентов осталось до цели или стопа. Помогает визуально оценить риски.
+
+## 
+
+## \---
+
+## 
+
+## &#x20;🆕 Логика работы и Безопасность
+
+## 
+
+## &#x20;1. Live Recovery (Восстановление при рестарте)
+
+## Если бот упал или перезагрузился, он не "забудет" открытые позиции:
+
+## 1\.  При старте `run\_live` делает `broker.get\_positions()`.
+
+## 2\.  Если на счете есть позиции, бот подхватывает их в память.
+
+## 3\.  Важно: Так как SL/TP хранятся в памяти бота, а не на бирже, после рестарта уровни SL/TP сбрасываются. Бот запишет предупреждение в лог. В этом случае позицию лучше закрыть вручную или перевести в ручной контроль, если нет сигнала на выход.
+
+## 
+
+## &#x20;2. Same Candle Protection (Защита от ложных срабатываний)
+
+## Бот не закроет позицию на той же свече, на которой открылся (`entry\_candle\_time`).
+
+## &#x20;  Зачем: Чтобы не закрываться по тени (wick), если свеча "проколола" SL и тут же вернулась.
+
+## &#x20;  Лог: `same\_candle\_skip\_sl\_tp`.
+
+## 
+
+## &#x20;3. Wick Monitoring (Мониторинг теней)
+
+## В логах добавлена детальная диагностика при срабатывании SL:
+
+## ```
+
+## \[LIVE CLOSE sl | ...]
+
+## \[LIVE Wick Monitor (SL Hit) | sl=15000.0 low=14999.0 close=15050.0]
+
+## ```
+
+## &#x20;  Если `low` пробил SL, а `close` далеко — вас выбило тенью.
+
+## 
+
+## \---
+
+## 
+
+## &#x20;Конфигурация (`config/params.yaml`)
+
+## 
+
+## Все параметры торговли задаются здесь.
+
+## 
+
+## ```yaml
+
+## risk:
+
+## &#x20; capital\_rub: 100000.0        Стартовый капитал
+
+## &#x20; max\_position\_pct: 0.30       Максимум 30% капитала на сделку
+
+## &#x20; max\_leverage: 5              Плечо (для расчета лота)
+
+## &#x20; daily\_loss\_limit\_pct: 0.05   Стоп-лосс дня (-5%)
+
+## &#x20; weekly\_loss\_limit\_pct: 0.10  Стоп-лосс недели (-10%)
+
+## &#x20; max\_trades\_per\_day: 10       Лимит сделок в день
+
+## 
+
+## strategy:
+
+## &#x20; ema\_fast: 9                  Быстрая EMA
+
+## &#x20; ema\_slow: 21                 Медленная EMA
+
+## &#x20; atr\_sl\_multiplier: 1.5       SL = 1.5  ATR
+
+## &#x20; atr\_tp\_multiplier: 3.0       TP = 3.0  ATR (RR 1:2)
+
+## &#x20; 
+
+## &#x20; global\_trend:
+
+## &#x20;   enabled: true              Фильтр по старшему ТФ
+
+## &#x20;   ema\_fast: 20
+
+## &#x20;   ema\_slow: 50
+
+## 
+
+## timeframe: "1h"                Таймфрейм свечей
+
+## ```
+
+## 
+
+## \---
+
+## 
+
+## &#x20;Тесты
+
+## ```bash
+
+## pytest tests/ -v
+
+## ```
+
+## Тесты используют синтетические данные, не требуя токенов API.
+
+## 
+
+## \---
+
+## 
+
+## &#x20;Добавление новой стратегии
+
+## 1\.  Создайте `strategy/my\_strategy.py`, унаследуйте `Strategy`.
+
+## 2\.  Реализуйте `generate\_signals()` и `add\_indicators()`.
+
+## 3\.  В `runner\_gui.py` замените импорт и инициализацию стратегии.
+
+## 4\.  Добавьте параметры в `config/params.yaml`.
+
+## 
+
+## \---
+
+## 
+
+## &#x20;Важные предупреждения
+
+## 1\.  Минимальный капитал: Для торговли фьючерсами в T-Invest требуется ГО (гарантийное обеспечение). Часто оно составляет 5000–10000 ₽ на контракт. С капиталом 1000 ₽ бот вернет `qty=0` и не выставит ордер.
+
+## &#x20;      Рекомендация: От 50 000 ₽ для стабильной работы.
+
+## 2\.  SL/TP в памяти: Бот следит за SL/TP по свечам. Если потеряется связь с интернетом или бот выключится — SL/TP не сработает, пока бот не запустится снова.
+
+## 3\.  Sandbox: Всегда тестируйте в режиме `sandbox=True` (настройки `.env`), прежде чем выводить на реальные деньги (`false`).
+
