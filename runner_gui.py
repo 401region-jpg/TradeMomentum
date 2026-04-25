@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
+from risk.contracts import get_futures_contract_by_ticker, FuturesContractSpec
 
 import psutil
 import yaml
@@ -275,6 +276,23 @@ async def run_paper(cfg: dict) -> None:
     lot_by_figi = {i["figi"]: i.get("lot", 1) for i in instruments}
     inst_by_ticker = {i["ticker"]: i for i in instruments}
 
+    # Загружаем спецификации фьючей по тикерам (если есть в risk/contracts.py или через API)
+    paper_contract_specs: dict[str, FuturesContractSpec] = {}
+    for inst in instruments:
+        t = inst["ticker"]
+        spec = get_futures_contract_by_ticker(t)
+        if spec:
+            paper_contract_specs[t] = spec
+            logger.info(
+                "[PAPER] Контракт %s: step=%s, step_amount=%s, size=%s",
+                t,
+                spec.min_price_increment,
+                spec.min_price_increment_amount,
+                spec.contract_size,
+            )
+        else:
+            logger.warning("[PAPER] Не удалось получить спецификацию фьюча для %s", t)
+
     if not figis:
         logger.error("Нет активных инструментов с FIGI")
         return
@@ -342,10 +360,6 @@ async def run_paper(cfg: dict) -> None:
             "positions": state_positions,
         }
         write_bot_state(state)
-
-    # Параметры фьюча для PAPER (заглушка — подставь свои)
-    MIN_PRICE_INCREMENT = Decimal("0.01")
-    MIN_PRICE_INCREMENT_AMOUNT = Decimal("0.7765")  # TODO: взять точное значение
 
     try:
         async for candle in feed.stream_candles(figis, tf_main):
@@ -440,15 +454,21 @@ async def run_paper(cfg: dict) -> None:
                         figi, ticker, exit_direction, qty_to_close, execution_price=close_price
                     )
 
-                    # PnL в рублях по фьючу
-                    pnl = futures_pnl_rub(
-                        entry_price=meta["entry_price"],
-                        exit_price=close_price,
-                        qty=qty_to_close,
-                        min_price_increment=MIN_PRICE_INCREMENT,
-                        min_price_increment_amount=MIN_PRICE_INCREMENT_AMOUNT,
-                        side=side,
-                    )
+                    spec = paper_contract_specs.get(ticker)
+                    if spec and spec.min_price_increment_amount > 0:
+                        pnl = futures_pnl_rub(
+                            entry_price=meta["entry_price"],
+                            exit_price=close_price,
+                            qty=qty_to_close,
+                            min_price_increment=spec.min_price_increment,
+                            min_price_increment_amount=spec.min_price_increment_amount,
+                            side=side,
+                        )
+                    else:
+                        # Фоллбек, если спецификации не нашли
+                        pnl = (close_price - meta["entry_price"]) * Decimal(
+                            qty_to_close if side == "long" else -qty_to_close
+                        )
                     risk.record_pnl(pnl)
                     risk.update_capital(broker.get_total_equity())
 
@@ -642,6 +662,23 @@ async def run_live(cfg: dict) -> None:
     lot_by_figi = {i["figi"]: i.get("lot", 1) for i in instruments}
     inst_by_ticker = {i["ticker"]: i for i in instruments}
 
+    # Загружаем спецификации фьючей по тикерам
+    live_contract_specs: dict[str, FuturesContractSpec] = {}
+    for inst in instruments:
+        t = inst["ticker"]
+        spec = get_futures_contract_by_ticker(t)
+        if spec:
+            live_contract_specs[t] = spec
+            logger.info(
+                "[LIVE] Контракт %s: step=%s, step_amount=%s, size=%s",
+                t,
+                spec.min_price_increment,
+                spec.min_price_increment_amount,
+                spec.contract_size,
+            )
+        else:
+            logger.warning("[LIVE] Не удалось получить спецификацию фьюча для %s", t)
+
     if not figis:
         logger.error("Нет активных инструментов с FIGI")
         return
@@ -698,10 +735,6 @@ async def run_live(cfg: dict) -> None:
             "positions": positions_view,
         }
         write_bot_state(state)
-
-    # Параметры фьюча для LIVE (заглушка — подставь свои)
-    MIN_PRICE_INCREMENT = Decimal("0.01")
-    MIN_PRICE_INCREMENT_AMOUNT = Decimal("0.7765")  # TODO: взять точное значение
 
     try:
         async for candle in feed.stream_candles(figis, tf_main):
@@ -795,14 +828,20 @@ async def run_live(cfg: dict) -> None:
                         qty_to_close,
                     )
 
-                    pnl = futures_pnl_rub(
-                        entry_price=pos["entry_price"],
-                        exit_price=close_price,
-                        qty=qty_to_close,
-                        min_price_increment=MIN_PRICE_INCREMENT,
-                        min_price_increment_amount=MIN_PRICE_INCREMENT_AMOUNT,
-                        side=pos["side"],
-                    )
+                    spec = live_contract_specs.get(ticker)
+                    if spec and spec.min_price_increment_amount > 0:
+                        pnl = futures_pnl_rub(
+                            entry_price=pos["entry_price"],
+                            exit_price=close_price,
+                            qty=qty_to_close,
+                            min_price_increment=spec.min_price_increment,
+                            min_price_increment_amount=spec.min_price_increment_amount,
+                            side=pos["side"],
+                        )
+                    else:
+                        pnl = (close_price - pos["entry_price"]) * Decimal(
+                            qty_to_close if pos["side"] == "long" else -qty_to_close
+                        )
                     risk.record_pnl(pnl)
 
                     await notifier.notify_trade_close(
