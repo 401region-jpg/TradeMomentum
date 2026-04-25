@@ -3,7 +3,8 @@ runner_gui.py — упрощённый раннер под GUI (paper + live)
 
 Использует те же модули, что runner.py, но:
 - добавляет online-лог trades/live_log.csv;
-- гарантированно и часто обновляет state/bot_state.json для GUI.
+- гарантированно и часто обновляет state/bot_state.json для GUI;
+- добавляет детальное логирование открытий/закрытий для отладки SL/TP.
 """
 
 from __future__ import annotations
@@ -111,7 +112,7 @@ def futures_pnl_rub(
     side: str,
 ) -> Decimal:
     """
-    PnL в рублях по фьючам Tinkoff (цены в пунктах, как в API). [web:184]
+    PnL в рублях по фьючам Tinkoff (цены в пунктах, как в API).
 
     Формула T-Invest:
     value = price / min_price_increment * min_price_increment_amount
@@ -457,6 +458,19 @@ async def run_paper(cfg: dict) -> None:
                         OrderDirection.SELL if current_pos.quantity > 0 else OrderDirection.BUY
                     )
 
+                    # >>> DEBUG LOG: PAPER CLOSE <<<
+                    logger.info(
+                        "[%s] PAPER CLOSE %s | side=%s entry=%.4f sl=%.4f tp=%.4f low=%.4f high=%.4f",
+                        ticker,
+                        close_reason,
+                        meta["side"],
+                        float(meta["entry_price"]),
+                        float(meta["sl"]),
+                        float(meta["tp"]),
+                        float(Decimal(str(candle["low"]))),
+                        float(Decimal(str(candle["high"]))),
+                    )
+
                     await broker.place_market_order(
                         figi, ticker, exit_direction, qty_to_close, execution_price=close_price
                     )
@@ -554,6 +568,17 @@ async def run_paper(cfg: dict) -> None:
                         "entry_time": now_utc.isoformat(),
                         "entry_candle_time": candle.get("time") or candle.get("ts"),
                     }
+
+                    # >>> DEBUG LOG: PAPER OPEN <<<
+                    logger.info(
+                        "[%s] PAPER OPEN | side=%s entry=%.4f sl=%.4f tp=%.4f candle_time=%s",
+                        ticker,
+                        entry_levels[ticker]["side"],
+                        float(price),
+                        float(entry_levels[ticker]["sl"]),
+                        float(entry_levels[ticker]["tp"]),
+                        candle.get("time") or candle.get("ts"),
+                    )
 
                     await notifier.notify_trade_open(
                         ticker,
@@ -836,6 +861,19 @@ async def run_live(cfg: dict) -> None:
                         OrderDirection.SELL if pos["side"] == "long" else OrderDirection.BUY
                     )
 
+                    # >>> DEBUG LOG: LIVE CLOSE <<<
+                    logger.info(
+                        "[%s] LIVE CLOSE %s | side=%s entry=%.4f sl=%.4f tp=%.4f low=%.4f high=%.4f",
+                        ticker,
+                        close_reason,
+                        pos["side"],
+                        float(pos["entry_price"]),
+                        float(pos["sl"]),
+                        float(pos["tp"]),
+                        float(Decimal(str(candle["low"]))),
+                        float(Decimal(str(candle["high"]))),
+                    )
+
                     await broker.place_market_order(
                         figi,
                         ticker,
@@ -947,6 +985,17 @@ async def run_live(cfg: dict) -> None:
                     "entry_time": now_utc.isoformat(),
                     "entry_candle_time": candle.get("time") or candle.get("ts"),
                 }
+
+                # >>> DEBUG LOG: LIVE OPEN <<<
+                logger.info(
+                    "[%s] LIVE OPEN | side=%s entry=%.4f sl=%.4f tp=%.4f candle_time=%s",
+                    ticker,
+                    live_positions[ticker]["side"],
+                    float(entry_price),
+                    float(live_positions[ticker]["sl"]),
+                    float(live_positions[ticker]["tp"]),
+                    candle.get("time") or candle.get("ts"),
+                )
 
                 await notifier.notify_trade_open(
                     ticker,
