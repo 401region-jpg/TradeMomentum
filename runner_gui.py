@@ -14,6 +14,7 @@ import csv
 import json
 import logging
 import logging.handlers
+import os
 import random
 import sys
 from datetime import datetime, timedelta, timezone
@@ -21,25 +22,123 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
+import psutil
 import yaml
 
 logger = logging.getLogger(__name__)
 
-# ── State для GUI ─────────────────────────────────────────────────────────────
+# ── State / PID для GUI ──────────────────────────────────────────────────────
 
-STATE_PATH = Path("state/bot_state.json")
-STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+STATE_DIR = Path("state")
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Стоп‑флаг, который может создать GUI (app.py), чтобы остановить раннер
-STOP_FLAG_PATH = Path("state/stop.flag")
+STATE_PATH = STATE_DIR / "bot_state.json"
+STOP_FLAG_PATH = STATE_DIR / "stop.flag"
+
+# заглушка для универсального пути (если будешь использовать в других модулях)
+BOT_STATE_PATH = STATE_PATH
+
+
+def read_bot_state() -> dict:
+    """Читает state/bot_state.json (если есть)."""
+    try:
+        if STATE_PATH.exists():
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning("Не удалось прочитать bot_state.json: %s", e)
+    return {}
 
 
 def write_bot_state(state: dict) -> None:
+    """Пишет произвольный state для GUI (equity, позиции, и т.п.)."""
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error("Не удалось записать state: %s", e)
+
+
+def write_pid_state(pid: int, mode: str, status: str = "running") -> None:
+    """
+    Пишет PID раннера + метаданные.
+
+    Используется app.py, чтобы не запускать второй экземпляр,
+    если PID из bot_state.json ещё жив.
+    """
+    state = read_bot_state()
+    state.update(
+        {
+            "runner_pid": pid,
+            "mode": mode,
+            "started_at": datetime.now(tz=timezone.utc).isoformat(),
+            "status": status,
+        }
+    )
+    write_bot_state(state)
+
+
+def clear_bot_state() -> None:
+    """Очищает bot_state.json (используем при штатной остановке)."""
+    try:
+        if STATE_PATH.exists():
+            STATE_PATH.unlink()
+    except Exception as e:
+        logger.warning("Не удалось удалить bot_state.json: %s", e)
+
+
+def is_pid_running(pid: int) -> bool:
+    """Проверка, жив ли процесс с таким PID (через psutil)."""
+    try:
+        p = psutil.Process(pid)
+        return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+    except Exception as e:
+        logger.warning("Ошибка при проверке PID %s: %s", pid, e)
+        return False
+
+
+# ── Универсальный helper для PnL по фьючам ───────────────────────────────────
+
+def futures_pnl_rub(
+    entry_price: Decimal,
+    exit_price: Decimal,
+    qty: int,
+    min_price_increment: Decimal,
+    min_price_increment_amount: Decimal,
+    side: str,
+) -> Decimal:
+    """
+    PnL в рублях по фьючам Tinkoff (цены в пунктах, как в API). [web:184]
+
+    Формула T-Invest:
+    value = price / min_price_increment * min_price_increment_amount
+
+    Здесь считаем:
+    1) сдвиг цены в пунктах (exit - entry);
+    2) перевод в количество шагов (делим на min_price_increment);
+    3) умножаем на стоимость шага и лоты.
+
+    side: 'long'/'short' или 'BUY'/'SELL'
+    """
+    if qty == 0:
+        return Decimal("0")
+
+    side_norm = side.lower()
+    raw_move = exit_price - entry_price
+
+    # для шорта движение цены инвертируем
+    if side_norm in ("sell", "short"):
+        raw_move = -raw_move
+
+    # сколько шагов прошло
+    steps = raw_move / min_price_increment
+
+    # PnL за 1 лот
+    pnl_per_lot_rub = steps * min_price_increment_amount
+
+    return pnl_per_lot_rub * Decimal(qty)
 
 
 # ── Online-лог сделок для GUI ────────────────────────────────────────────────
@@ -213,7 +312,7 @@ async def run_paper(cfg: dict) -> None:
         except Exception:
             total_equity = Decimal(str(cfg["risk"]["capital_rub"]))
 
-        capital_cfg = Decimal(str(cfg["risk"]["capital_rub"]]))
+        capital_cfg = Decimal(str(cfg["risk"]["capital_rub"]))
         pnl_total = total_equity - capital_cfg
 
         prices = {t: float(p) for t, p in gui_prices.items()}
@@ -243,6 +342,10 @@ async def run_paper(cfg: dict) -> None:
             "positions": state_positions,
         }
         write_bot_state(state)
+
+    # Параметры фьюча для PAPER (заглушка — подставь свои)
+    MIN_PRICE_INCREMENT = Decimal("0.01")
+    MIN_PRICE_INCREMENT_AMOUNT = Decimal("0.7765")  # TODO: взять точное значение
 
     try:
         async for candle in feed.stream_candles(figis, tf_main):
@@ -337,8 +440,14 @@ async def run_paper(cfg: dict) -> None:
                         figi, ticker, exit_direction, qty_to_close, execution_price=close_price
                     )
 
-                    pnl = (close_price - meta["entry_price"]) * Decimal(
-                        qty_to_close if side == "long" else -qty_to_close
+                    # PnL в рублях по фьючу
+                    pnl = futures_pnl_rub(
+                        entry_price=meta["entry_price"],
+                        exit_price=close_price,
+                        qty=qty_to_close,
+                        min_price_increment=MIN_PRICE_INCREMENT,
+                        min_price_increment_amount=MIN_PRICE_INCREMENT_AMOUNT,
+                        side=side,
                     )
                     risk.record_pnl(pnl)
                     risk.update_capital(broker.get_total_equity())
@@ -368,7 +477,7 @@ async def run_paper(cfg: dict) -> None:
                     )
 
                     logger.info(
-                        "[%s] Закрытие по %s | entry=%.4f exit=%.4f pnl=%.2f",
+                        "[%s] Закрытие по %s | entry=%.4f exit=%.4f pnl=%.2f ₽",
                         ticker,
                         close_reason,
                         float(meta["entry_price"]),
@@ -467,6 +576,8 @@ async def run_paper(cfg: dict) -> None:
         from runner import _save_paper_trades
         _save_paper_trades(broker.get_trade_log())
         await snapshot_paper_state(reason="final")
+        # при штатной остановке можно очистить PID-состояние (если используешь)
+        clear_bot_state()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -588,6 +699,10 @@ async def run_live(cfg: dict) -> None:
         }
         write_bot_state(state)
 
+    # Параметры фьюча для LIVE (заглушка — подставь свои)
+    MIN_PRICE_INCREMENT = Decimal("0.01")
+    MIN_PRICE_INCREMENT_AMOUNT = Decimal("0.7765")  # TODO: взять точное значение
+
     try:
         async for candle in feed.stream_candles(figis, tf_main):
             # Проверка стоп-флага от GUI
@@ -602,8 +717,8 @@ async def run_live(cfg: dict) -> None:
             now_utc = datetime.now(tz=timezone.utc)
 
             candle_buffers[figi].append(candle)
-            if len(candle_buffers[figi]) > 500:
-                candle_buffers[figi] = candle_buffers[figi][-500:]
+            if len(candle_buffers[figи]) > 500:
+                candle_buffers[figи] = candle_buffers[figи][-500:]
 
             price_dec = Decimal(str(candle["close"]))
             gui_prices[ticker] = price_dec
@@ -622,9 +737,9 @@ async def run_live(cfg: dict) -> None:
             gt_counter += 1
             if gt_enabled and gt_counter % gt_refresh_interval == 0:
                 inst = inst_by_ticker.get(ticker, {})
-                global_figи = inst.get("global_figi") or figi
+                global_figi = inst.get("global_figi") or figi
                 df_h = await feed.get_candles(
-                    global_figи, tf_global, now_utc - timedelta(days=5), now_utc
+                    global_figi, tf_global, now_utc - timedelta(days=5), now_utc
                 )
                 trend = compute_global_trend(
                     df_h,
@@ -680,8 +795,13 @@ async def run_live(cfg: dict) -> None:
                         qty_to_close,
                     )
 
-                    pnl = (close_price - pos["entry_price"]) * Decimal(
-                        qty_to_close if pos["side"] == "long" else -qty_to_close
+                    pnl = futures_pnl_rub(
+                        entry_price=pos["entry_price"],
+                        exit_price=close_price,
+                        qty=qty_to_close,
+                        min_price_increment=MIN_PRICE_INCREMENT,
+                        min_price_increment_amount=MIN_PRICE_INCREMENT_AMOUNT,
+                        side=pos["side"],
                     )
                     risk.record_pnl(pnl)
 
@@ -820,6 +940,7 @@ async def run_live(cfg: dict) -> None:
         if not stop_notified:
             await notifier.notify_bot_stopped(stop_reason)
         await snapshot_live_state(reason="final")
+        clear_bot_state()
 
 
 # ── CLI для runner_gui ───────────────────────────────────────────────────────
