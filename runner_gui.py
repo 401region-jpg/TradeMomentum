@@ -1384,4 +1384,3 @@ def _sync_orders(broker, figi, active_orders, desired_orders, strategy, risk_mgr
                     "REFRESH %s %.2f → %.2f (drift) → %s",
                     side_str, ao.price, desired.price, oid
                 )
-```
