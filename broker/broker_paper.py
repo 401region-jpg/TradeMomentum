@@ -233,3 +233,76 @@ class PaperBrokerClient(BrokerClient):
                 "duration_min": (ts - pos.opened_at).seconds // 60,
             }
         )
+
+# broker/broker_paper.py — ДОПОЛНЕНИЕ
+
+import time
+import uuid
+from broker.base import ActiveOrder
+
+
+class PaperBrokerClient:
+    """Дополнение к существующему paper-симулятору."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._limit_orders: dict[str, dict] = {}  # order_id → order_dict
+        self._position_qty: dict[str, int] = {}
+
+    def place_limit_order(self, figi: str, side: str, qty: int, price: float) -> str:
+        order_id = f"paper_{uuid.uuid4().hex[:8]}"
+        self._limit_orders[order_id] = {
+            "figi": figi, "side": side, "qty": qty,
+            "price": price, "created_at": time.time(),
+        }
+        return order_id
+
+    def cancel_order(self, order_id: str) -> bool:
+        return self._limit_orders.pop(order_id, None) is not None
+
+    def get_active_orders(self, figi: str) -> list:
+        return [
+            ActiveOrder(
+                order_id=oid,
+                side=o["side"],
+                price=o["price"],
+                qty=o["qty"],
+                created_at=o["created_at"],
+            )
+            for oid, o in self._limit_orders.items()
+            if o["figi"] == figi
+        ]
+
+    def get_order_book(self, figi: str, depth: int = 20) -> dict:
+        # В paper-режиме возвращаем синтетический стакан на основе last_price
+        mid = self._last_price.get(figi, 90000.0)
+        step = 10.0  # шаг цены BTC
+        bids = [(mid - step * i, 1) for i in range(1, depth + 1)]
+        asks = [(mid + step * i, 1) for i in range(1, depth + 1)]
+        return {"bids": bids, "asks": asks}
+
+    def get_position_qty(self, figi: str) -> int:
+        return self._position_qty.get(figi, 0)
+
+    def simulate_fills(self, figi: str, current_bid: float, current_ask: float) -> list:
+        """
+        Вызывается каждый тик — проверяет, исполнились ли лимитки.
+        Возвращает список исполненных ордеров.
+        """
+        filled = []
+        to_remove = []
+        for order_id, o in self._limit_orders.items():
+            if o["figi"] != figi:
+                continue
+            if o["side"] == "BUY" and current_ask <= o["price"]:
+                filled.append(o)
+                to_remove.append(order_id)
+                self._position_qty[figi] = self._position_qty.get(figi, 0) + o["qty"]
+            elif o["side"] == "SELL" and current_bid >= o["price"]:
+                filled.append(o)
+                to_remove.append(order_id)
+                self._position_qty[figi] = self._position_qty.get(figi, 0) - o["qty"]
+        for oid in to_remove:
+            del self._limit_orders[oid]
+        return filled
+```
