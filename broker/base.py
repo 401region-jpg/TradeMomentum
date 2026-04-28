@@ -3,30 +3,30 @@ broker/base.py
 Абстрактный интерфейс брокера.
 """
 from __future__ import annotations
- 
+
 import datetime
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
-from typing import Optional
- 
- 
+from typing import Optional, List
+
+
 class OrderDirection(Enum):
     BUY = "buy"
     SELL = "sell"
- 
+
     def opposite(self) -> "OrderDirection":
         return OrderDirection.SELL if self == OrderDirection.BUY else OrderDirection.BUY
- 
- 
+
+
 class OrderStatus(Enum):
     PENDING = "pending"
     FILLED = "filled"
     CANCELLED = "cancelled"
     REJECTED = "rejected"
- 
- 
+
+
 @dataclass
 class Position:
     instrument_uid: str
@@ -37,24 +37,24 @@ class Position:
     opened_at: datetime.datetime = field(default_factory=datetime.datetime.utcnow)
     sl_price: Optional[Decimal] = None
     tp_price: Optional[Decimal] = None
- 
+
     @property
     def is_long(self) -> bool:
         return self.quantity > 0
- 
+
     @property
     def is_short(self) -> bool:
         return self.quantity < 0
- 
+
     @property
     def unrealized_pnl(self) -> Decimal:
         return (self.current_price - self.avg_price) * self.quantity
- 
+
     @property
     def direction(self) -> OrderDirection:
         return OrderDirection.BUY if self.quantity > 0 else OrderDirection.SELL
- 
- 
+
+
 @dataclass
 class Order:
     uid: str
@@ -68,18 +68,35 @@ class Order:
     created_at: datetime.datetime = field(default_factory=datetime.datetime.utcnow)
     filled_at: Optional[datetime.datetime] = None
     error_message: Optional[str] = None
- 
- 
+
+
+# === ДОПОЛНЕНИЕ ДЛЯ MM: активные лимитные ордера ===
+@dataclass
+class ActiveOrder:
+    uid: str
+    instrument_uid: str
+    ticker: str
+    direction: OrderDirection  # BUY / SELL
+    price: Decimal
+    quantity: int
+    created_at: datetime.datetime = field(default_factory=datetime.datetime.utcnow)
+
+
 class BrokerClient(ABC):
- 
+    """
+    Базовый асинхронный интерфейс брокера.
+    """
+
+    # --- существующие методы для свечного бота ---
+
     @abstractmethod
     async def get_balance(self) -> Decimal:
         ...
- 
+
     @abstractmethod
     async def get_positions(self) -> list[Position]:
         ...
- 
+
     @abstractmethod
     async def place_market_order(
         self,
@@ -89,74 +106,49 @@ class BrokerClient(ABC):
         quantity: int,
     ) -> Order:
         ...
- 
+
     @abstractmethod
     async def cancel_order(self, order_uid: str) -> bool:
         ...
- 
+
     @abstractmethod
     async def sync_positions(self) -> None:
+        ...
 
-# broker/base.py (дополнение к существующим методам)
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Optional
-
-
-@dataclass
-class ActiveOrder:
-    order_id: str
-    side: str          # "BUY" / "SELL"
-    price: float
-    qty: int
-    created_at: float  # timestamp
-
-
-class BrokerClient(ABC):
-    # --- существующие методы ---
-    @abstractmethod
-    def place_order(self, figi: str, side: str, qty: int, order_type: str) -> str:
-        """Рыночный ордер. Возвращает order_id."""
-        raise NotImplementedError
+    # --- НОВЫЕ async‑методы для MM‑режима ---
 
     @abstractmethod
-    def get_positions(self) -> list:
-        raise NotImplementedError
-
-    # --- НОВЫЕ методы для MM ---
-    @abstractmethod
-    def place_limit_order(self, figi: str, side: str, qty: int, price: float) -> str:
+    async def place_limit_order(
+        self,
+        instrument_uid: str,
+        ticker: str,
+        direction: OrderDirection,
+        quantity: int,
+        price: Decimal,
+    ) -> Order:
         """
         Выставляет лимитный ордер.
-        Возвращает order_id (строка).
+        Возвращает Order с uid/статусом.
         """
-        raise NotImplementedError
+        ...
 
     @abstractmethod
-    def cancel_order(self, order_id: str) -> bool:
+    async def get_active_orders(self, instrument_uid: str) -> List[ActiveOrder]:
         """
-        Отменяет ордер по ID.
-        Возвращает True при успехе.
+        Список активных лимитных ордеров по инструменту.
         """
-        raise NotImplementedError
+        ...
 
     @abstractmethod
-    def get_active_orders(self, figi: str) -> List[ActiveOrder]:
+    async def get_order_book(self, instrument_uid: str, depth: int = 20) -> dict:
         """
-        Возвращает список активных ордеров по инструменту.
+        Стакан: {"bids": [(price, qty)], "asks": [(price, qty)]}.
         """
-        raise NotImplementedError
+        ...
 
     @abstractmethod
-    def get_order_book(self, figi: str, depth: int = 20) -> dict:
+    async def get_position_qty(self, instrument_uid: str) -> int:
         """
-        Возвращает стакан: {"bids": [(price, qty)], "asks": [(price, qty)]}
+        Нетто‑позиция по инструменту (+лонг, -шорт, 0).
         """
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_position_qty(self, figi: str) -> int:
-        """
-        Возвращает текущую нетто-позицию (+ лонг, - шорт, 0 = нет).
-        """
-        raise NotImplementedError
+        ...
