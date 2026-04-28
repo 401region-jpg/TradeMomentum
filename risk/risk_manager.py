@@ -1,15 +1,9 @@
-"""
-risk/risk_manager.py  v6 — session risk + margin_per_lot + мягкий R:R
-
-Ключевые моменты:
-  - Сессионный риск: normal / boost / evening (разный max_position_pct)
-  - get_session_info() → возвращает (label, pct, require_trend) для текущего времени МСК
-  - Логи: "SESSION=BOOST | position_pct=8.0%"
-  - УЧЁТ ГО: margin_per_lot — ограничивает qty по доступной марже
-  - Портфельный лимит сделок убран: бот может делать сколько угодно входов
-  - Ограничение по R:R ослаблено — низкий R:R не блокирует вход, только даёт warning
-  - Добавлена защита: дневной/недельный лимит по % капитала, защита от аномального PnL
-"""
+# risk/risk_manager.py  v6 — session risk + margin_per_lot + мягкий R:R
+#
+# Добавлено:
+#   - max_active_orders / max_inventory_lots / max_exposure_pct для MM
+#   - check_can_place_order(...) для лимитных заявок MM
+#   - calc_mm_qty(...) — расчёт размера MM-ордера (консервативно)
 
 from __future__ import annotations
 
@@ -90,7 +84,7 @@ class RiskManager:
         self._daily_loss_limit_pct = float(r.get("daily_loss_limit_pct", 1.0))
         self._weekly_loss_limit_pct = float(r.get("weekly_loss_limit_pct", 1.0))
 
-        # Лимит позиций одновременно
+        # Лимит позиций одновременно (для свечного режима)
         self._max_positions = int(s.get("max_positions", 1))
 
         # ГО на 1 лот (в рублях); если не задано, считаем, что не ограничивает
@@ -109,7 +103,7 @@ class RiskManager:
         self._max_consec_losses = int(r.get("max_consecutive_losses", 999))
         self._cooldown_min = int(r.get("cooldown_after_loss_min", 0))
 
-        # Проверка R:R по конфигу стратегии
+        # Проверка R:R по конфигу стратегии (для свечного режима)
         sl = float(s.get("atr_sl_multiplier", 1.0))
         tp = float(s.get("atr_tp_multiplier", 2.0))
         self._configured_rr = tp / sl if sl > 0 else 0.0
@@ -140,15 +134,22 @@ class RiskManager:
             )
 
         # Состояние (сбрасывается ежедневно / еженедельно)
+        _today = datetime.date.today()
+        self._current_date = _today
+        self._current_week = _today.isocalendar()[1]
+
         self._day_pnl = Decimal("0")
         self._week_pnl = Decimal("0")
         self._portfolio_trades = 0
         self._consec_losses = 0
         self._last_loss_time: Optional[datetime.datetime] = None
 
-        _today = datetime.date.today()
-        self._current_date = _today
-        self._current_week = _today.isocalendar()[1]
+        # === НОВОЕ: параметры для market-maker режима ===
+        mm = cfg.get("market_maker", {})
+        self.max_active_orders: int = int(mm.get("max_active_orders", 4))
+        self.max_inventory_lots: int = int(mm.get("max_inventory_lots", 5))
+        # Максимальная экспозиция на один MM-ордер как доля капитала
+        self.max_exposure_pct: float = float(mm.get("max_exposure_pct", 0.20))
 
     # ── Сессионный риск ───────────────────────────────────────────────────────
 
@@ -184,7 +185,9 @@ class RiskManager:
     def update_capital(self, c: Decimal) -> None:
         """Обновление капитала по счёту брокера."""
         if c <= 0:
-            logger.warning("Попытка обновить капитал некорректным значением: %.2f", float(c))
+            logger.warning(
+                "Попытка обновить капитал некорректным значением: %.2f", float(c)
+            )
             return
         self._capital = c
 
@@ -255,7 +258,7 @@ class RiskManager:
         logger.info("🔄 Сброс недели. PnL: %.2f ₽", float(self._week_pnl))
         self._week_pnl = Decimal("0")
 
-    # ── Проверки перед входом ─────────────────────────────────────────────────
+    # ── Проверки перед входом (свечной режим) ────────────────────────────────
 
     def check_entry_allowed(
         self,
@@ -323,7 +326,7 @@ class RiskManager:
             self.reset_weekly()
             self._current_week = week
 
-    # ── Размер позиции (с учётом сессии и ГО) ────────────────────────────────
+    # ── Размер позиции (свечной режим, через стоп) ───────────────────────────
 
     def calculate_quantity(
         self,
@@ -350,7 +353,8 @@ class RiskManager:
         # Ограничение по R:R теперь не блокирует вход, только предупреждает
         if self._configured_rr < MIN_RR:
             logger.warning(
-                "⚠️ Низкий R:R=%.2f < %.1f — расчёт qty разрешён, но настройка atr_sl/atr_tp выглядит агрессивной.",
+                "⚠️ Низкий R:R=%.2f < %.1f — расчёт qty разрешён, "
+                "но настройка atr_sl/atr_tp выглядит агрессивной.",
                 self._configured_rr,
                 MIN_RR,
             )
@@ -367,9 +371,7 @@ class RiskManager:
             )
             position_pct = 1.0
         if position_pct <= 0:
-            logger.warning(
-                "position_pct=0 для сессии %s — qty=0", ses_label
-            )
+            logger.warning("position_pct=0 для сессии %s — qty=0", ses_label)
             return 0
 
         logger.info(
@@ -438,6 +440,71 @@ class RiskManager:
             )
 
         return max(qty, 0)
+
+    # ── НОВОЕ: проверки для MM-лимиток ────────────────────────────────────────
+
+    def check_can_place_order(
+        self,
+        side: str,
+        active_orders: list,
+        current_inventory: int,
+        price: float,
+        qty: int,
+    ) -> tuple[bool, str]:
+        """
+        Проверяет, можно ли выставить новый MM-ордер (лимитку).
+        Возвращает (allowed: bool, reason: str).
+        side — "BUY"/"SELL"
+        """
+        # 1. Лимит активных ордеров
+        if len(active_orders) >= self.max_active_orders:
+            return False, f"max_active_orders={self.max_active_orders} reached"
+
+        # 2. Лимит инвентаря
+        projected_inv = current_inventory + (qty if side == "BUY" else -qty)
+        if abs(projected_inv) > self.max_inventory_lots:
+            return False, f"inventory limit {self.max_inventory_lots} would be exceeded"
+
+        # 3. Дневной PnL лимит — повторно не считаем, но можно использовать ту же логику
+        try:
+            self._check_daily_limit()
+        except DailyLimitExceeded:
+            return False, "daily loss limit hit"
+
+        # 4. Экспозиция на один ордер
+        order_value_rub = Decimal(str(price)) * Decimal(str(qty)) * Decimal(
+            str(self._lot_size_factor())
+        )
+        max_single = self._capital * Decimal(str(self.max_exposure_pct))
+        if order_value_rub > max_single:
+            return False, "single order exposure too large"
+
+        return True, "ok"
+
+    def calc_mm_qty(self, price: float, inventory: int) -> int:
+        """
+        Размер лота для MM-ордера (по умолчанию 1, можно масштабировать по капиталу).
+        """
+        # Консервативно: 1 лот, если не перелимит инвентаря
+        if abs(inventory) >= self.max_inventory_lots:
+            return 0
+
+        # Масштаб по капиталу (очень грубо, без учёта ГО)
+        try:
+            max_lots_by_capital = int(
+                float(self._capital) * self._default_position_pct / max(price, 1.0)
+            )
+        except Exception:
+            max_lots_by_capital = 1
+
+        return max(1, min(1, max_lots_by_capital))  # пока всегда 1
+
+    def _lot_size_factor(self) -> float:
+        """
+        Стоимость 1 лота BTCUSDperpA в рублях (приблизительно).
+        Для точности можно подтянуть из contracts.py.
+        """
+        return 1.0
 
     # ── Геттеры ───────────────────────────────────────────────────────────────
 
