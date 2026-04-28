@@ -297,3 +297,59 @@ def get_futures_contract_by_ticker(ticker: str) -> Optional[FuturesContractSpec]
 
 def get_futures_contract_by_figi(figi: str) -> Optional[FuturesContractSpec]:
     return get_futures_contract_spec(ticker=None, figi=figi, use_api=True)
+
+# В конец того же файла, где FuturesContractSpec / get_futures_contract_spec
+
+def calc_pnl_rub_from_spec(
+    spec: FuturesContractSpec,
+    entry_price: float,
+    exit_price: float,
+    qty: int,
+    side: str,        # "long" или "short"
+    usd_rub_rate: float = 90.0,
+) -> float:
+    """
+    PnL в рублях для фьючерса на BTC.
+
+    Для BTCUSDperpA (USD-номинированный перп):
+      pnl_usd = (exit - entry) * qty * sign
+      pnl_rub = pnl_usd * usd_rub_rate
+
+    Для чисто рублёвых фьючей можно считать через шаг цены:
+      pnl_rub = (exit - entry) / min_price_increment * min_price_increment_amount * qty
+    """
+    sign = 1 if side == "long" else -1
+
+    # Пример: для BTCUSDperpA считаем сразу в USD и умножаем на курс
+    if spec.ticker == "BTCUSDperpA":
+        pnl_usd = (exit_price - entry_price) * qty * sign
+        return pnl_usd * usd_rub_rate
+
+    # Общий случай через шаг цены
+    ticks = (exit_price - entry_price) / float(spec.min_price_increment)
+    pnl_rub = ticks * float(spec.min_price_increment_amount) * qty * sign
+    return pnl_rub
+
+
+def calc_pnl_rub(
+    ticker: str,
+    entry_price: float,
+    exit_price: float,
+    qty: int,
+    side: str,
+    usd_rub_rate: float = 90.0,
+) -> float:
+    """
+    Обёртка: сам подтягивает spec через get_futures_contract_spec().
+    """
+    spec = get_futures_contract_spec(ticker=ticker)
+    if spec is None:
+        raise ValueError(f"Unknown instrument spec for ticker={ticker}")
+    return calc_pnl_rub_from_spec(
+        spec=spec,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        qty=qty,
+        side=side,
+        usd_rub_rate=usd_rub_rate,
+    )
