@@ -968,6 +968,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Запустить live execution loop без отправки реальных ордеров",
     )
+    p.add_argument(
+        "--find-figi",
+        metavar="TICKER",
+        help="Найти FIGI по тикеру",
+    )
     return p.parse_args()
 
 
@@ -977,9 +982,11 @@ async def main() -> None:
     setup_logging(cfg)
 
     try:
+        # === ПОИСК FIGI ПО ТИКЕРУ ===
         if args.find_figi:
             await find_figi(args.find_figi)
             return
+        # ============================
 
         logger.info("Режим: %s | Конфиг: %s", args.mode.upper(), args.config)
 
@@ -1000,7 +1007,6 @@ async def main() -> None:
     except Exception:
         logger.exception("Необработанная ошибка в main()")
         raise
-
 
 if __name__ == "__main__":
     asyncio.run(main())
