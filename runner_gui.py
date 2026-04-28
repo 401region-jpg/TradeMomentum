@@ -103,6 +103,8 @@ def is_pid_running(pid: int) -> bool:
         return False
 
 
+from decimal import Decimal
+
 # ── Универсальный helper для PnL по фьючам ───────────────────────────────────
 
 def futures_pnl_rub(
@@ -112,24 +114,28 @@ def futures_pnl_rub(
     min_price_increment: Decimal,
     min_price_increment_amount: Decimal,
     side: str,
+    ticker: str | None = None,
 ) -> Decimal:
     """
-    PnL в рублях по фьючам Tinkoff (цены в пунктах, как в API).
+    PnL в рублях по фьючам Tinkoff.
 
-    Формула T-Invest:
-    value = price / min_price_increment * min_price_increment_amount
-
-    Здесь считаем:
-    1) сдвиг цены в пунктах (exit - entry);
-    2) перевод в количество шагов (делим на min_price_increment);
-    3) умножаем на стоимость шага и лоты.
-
-    side: 'long'/'short' или 'BUY'/'SELL'
+    Для большинства фьючей (Si, BR, S1M6 и т.п.) считаем через шаг и стоимость шага.
+    Для BTCUSDperpA используем прямое движение цены * qty, т.к. контракт нефондовый.
     """
     if qty == 0:
         return Decimal("0")
 
-    side_norm = side.lower()
+    side_norm = (side or "").lower()
+
+    # Спец-кейс для BTCUSDperpA: считаем напрямую
+    if ticker == "BTCUSDperpA":
+        raw_move = exit_price - entry_price
+        if side_norm in ("sell", "short"):
+            raw_move = -raw_move
+        # предполагаем, что 1 контракт = 1 "единица" цены, PnL уже в рублях
+        return raw_move * Decimal(qty)
+
+    # Стандартный расчёт через шаг и стоимость шага
     raw_move = exit_price - entry_price
 
     # для шорта движение цены инвертируем
@@ -1011,6 +1017,7 @@ async def run_live(cfg: dict) -> None:
                             min_price_increment=spec.min_price_increment,
                             min_price_increment_amount=spec.min_price_increment_amount,
                             side=pos["side"],
+                            ticker=ticker,
                         )
                     else:
                         pnl = (close_price - pos["entry_price"]) * Decimal(
@@ -1085,6 +1092,15 @@ async def run_live(cfg: dict) -> None:
                     margin_per_lot=margin_per_lot,
                 )
                 if qty <= 0:
+                   logger.warning("%s | qty<=0 после расчёта риска — сигнал пропускаем", ticker)
+                   continue
+
+                # Дополнительный safety: ограничим лотность сверху
+                if qty > 1:
+                   logger.warning("%s | qty=%d > 1 — урезаем до 1 лота для LIVE-режима защиты", ticker, qty)
+                   qty = 1
+
+                if qty <= 0:
                     continue
 
                 direction = (
@@ -1095,7 +1111,7 @@ async def run_live(cfg: dict) -> None:
                 if order.status.value == "rejected":
                     logger.error("[%s] Ордер отклонён: %s", ticker, order.error_message)
                     continue
-                entry_price = order.filled_price or price
+                entry_price = Decimal(str(order.filled_price)) if order.filled_price is not None else price
 
                 live_positions[ticker] = {
                     "side": "long" if sig.type == SignalType.LONG else "short",
@@ -1205,7 +1221,6 @@ async def main() -> None:
     except Exception:
         logger.exception("Необработанная ошибка в runner_gui.main()")
         raise
-
 
 if __name__ == "__main__":
     asyncio.run(main())
