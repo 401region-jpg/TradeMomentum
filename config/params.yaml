@@ -1,10 +1,9 @@
 # ============================================================
-# config/params.yaml  v10 — BTC 1m, мелкий TP
+# config/params.yaml  v11 — BTC MM + старая Momentum
 #
-# BTC:
-#   SL = 1.0 ATR
-#   TP = 0.05 ATR → R:R ≈ 0.05
-#   Частые, короткие тейки, Direction Lock выключен для BTC.
+# BTCUSDperpA:
+#   - может торговаться как свечной MomentumStrategy (как раньше)
+#   - и как маркет-мейкер по стакану (market_maker-блок ниже)
 # ============================================================
 
 instruments:
@@ -18,12 +17,13 @@ instruments:
 
   - ticker: "BTCUSDperpA"
     name: "BTCUSDT perp"
-    figi: "BTCUSDPERP00"
-    lot: 1
+    figi: "BTCUSDPERP00"      # ОБНОВИ через find_instrument.py
+    lot: 1                    # 1 контракт = 1 лот
     currency: "RUB"
     global_figi: "BTCUSDPERP00"
     enabled: true
-    # Специальные параметры стратегии для BTC
+
+    # Специальные параметры стратегии для BTC (свечной режим, если нужен)
     atr_sl_multiplier: 1.0
     atr_tp_multiplier: 0.05
     # Фильтры помягче для частых входов
@@ -33,10 +33,15 @@ instruments:
     # Глобальный тренд для BTC можно ослабить
     use_global_trend: false
 
+    # Параметры инструмента для MM
+    price_step: 10.0         # минимальный шаг цены BTCUSDperpA (уточни у Т-Банка)
+    step_price_rub: 10.0     # стоимость 1 шага в рублях (уточни по спецификации)
+
 timeframe: "5m"
 global_trend_timeframe: "4h"
 
 strategy:
+  # Имя классической свечной стратегии (MomentumStrategy)
   name: "MomentumStrategy"
 
   ema_fast: 20
@@ -91,35 +96,92 @@ strategy:
   range:
     enabled: false
 
-risk:
-  capital_rub: 1000.0
-  max_position_pct: 1       # до 100% капитала под позицию (для расчёта)
-  max_leverage: 8
+# ── Риск-менеджмент (общий) ─────────────────────────────────────────────
 
-  daily_loss_limit_pct: 100
-  weekly_loss_limit_pct: 100
+risk:
+  capital_rub: 100000.0         # стартовый капитал под расчёты MM/свечной
+  max_position_pct: 0.30        # базовый лимит на сделку (30% капитала)
+  max_leverage: 5
+
+  daily_loss_limit_pct: 0.02    # стоп дня -2% капитала
+  weekly_loss_limit_pct: 0.05   # стоп недели -5%
 
   allow_shorts: true
-  max_consecutive_losses: 8
-  cooldown_after_loss_min: 3
+  max_consecutive_losses: 5
+  cooldown_after_loss_min: 5
 
+  # Сессионные лимиты для свечного режима
   sessions:
     normal:
       start: "09:00"
       end: "16:00"
-      max_position_pct: 1
+      max_position_pct: 0.30
       label: "NORMAL"
     boost:
       start: "16:00"
       end: "20:00"
-      max_position_pct: 1
+      max_position_pct: 0.30
       label: "BOOST"
     evening:
       start: "20:00"
       end: "23:50"
-      max_position_pct: 1
+      max_position_pct: 0.20
       label: "EVENING"
       require_global_trend: true
+
+  # ГО на 1 лот BTC, если хочешь задать жёстко
+  margin_per_lot: null   # можно заполнить после get_futures_margin()
+
+# ── Market Maker-параметры (используются RiskManager + OrderBookMMStrategy) ─
+
+market_maker:
+  # Параметры котирования (target_profit_pct = round-trip)
+  target_profit_pct:            0.08    # целевой профит на round-trip (% ≈ 0.08)
+  min_spread_pct:               0.03    # минимальный спред для входа (%)
+  quote_refresh_threshold_pct:  0.02    # порог пересмотра котировки (%)
+  order_ttl_seconds:            30      # время жизни лимитки
+
+  # Ордера и объёмы
+  max_active_orders:    4              # макс ордеров одновременно (2 bid + 2 ask)
+  lots_per_order:       1              # размер каждого ордера (лот)
+  max_exposure_pct:     0.20           # макс экспозиция 20% капитала на ОДИН ордер
+
+  # Инвентарь
+  max_inventory_lots:       5          # макс |позиция| в лотах
+  inventory_skew_per_lot:   0.005      # смещение цены (%/лот) при накоплении позиции
+
+  # Тренд
+  trend_skew_pct:   0.015              # смещение по направлению тренда (%)
+
+  # Технические
+  loop_interval_seconds:  3            # частота главного цикла (сек)
+  order_book_depth:       20           # глубина стакана
+
+# ── Источник глобального тренда для MM (через Binance) ──────────────────────
+
+trend_feed:
+  enabled:                  true
+  symbol:                   "BTCUSDT"
+  interval:                 "1h"       # таймфрейм для EMA
+  ema_fast:                 20
+  ema_slow:                 50
+  update_interval_minutes:  5
+
+# ── Торговые сессии под MM (если захочешь менять loop_interval по времени) ──
+# Эти параметры ты можешь читать уже в runner_gui, если нужно.
+mm_sessions:
+  normal:
+    hours: "09:00-18:00"
+    loop_interval_seconds: 3
+  boost:
+    hours: "18:00-23:00"
+    loop_interval_seconds: 2
+  evening:
+    hours: "23:00-09:00"
+    loop_interval_seconds: 10
+    max_active_orders: 2              # ночью осторожнее
+
+# ── Общие сессионные настройки биржи ────────────────────────────────────────
 
 session:
   main_open: "09:00"
@@ -129,21 +191,25 @@ session:
   use_evening_session: true
   timezone: "Europe/Moscow"
 
+# ── Логи ────────────────────────────────────────────────────────────────────
+
 logging:
   level: "INFO"
-  file: "logs/bot_silver_v9.log"
+  file: "logs/bot_btc_mm_v11.log"
   max_bytes: 10485760
   backup_count: 5
+
+# ── Уведомления (можно завести отдельные ивенты под MM) ─────────────────────
 
 notifications:
   on_trade_open: false
   on_trade_close: false
   on_sl_tp_update: false
-  on_error: false
+  on_error: true
   on_daily_summary: false
   on_weekly_summary: false
-  on_drawdown_limit: false
-  on_bot_start_stop: false
-  on_no_data: false
+  on_drawdown_limit: true
+  on_bot_start_stop: true
+  on_no_data: true
   daily_summary_time: "18:55"
   weekly_summary_day: "friday"
