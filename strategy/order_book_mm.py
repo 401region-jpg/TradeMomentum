@@ -134,4 +134,3 @@ class OrderBookMMStrategy(MarketMakerStrategy):
             "avg_buy":  sum(f["price"] for f in buys)  / max(len(buys), 1),
             "avg_sell": sum(f["price"] for f in sells) / max(len(sells), 1),
         }
-```
