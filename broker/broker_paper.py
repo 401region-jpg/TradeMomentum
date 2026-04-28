@@ -305,4 +305,3 @@ class PaperBrokerClient:
         for oid in to_remove:
             del self._limit_orders[oid]
         return filled
-```
