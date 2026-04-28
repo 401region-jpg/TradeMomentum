@@ -1,21 +1,10 @@
 # ============================================================
-# config/params_high_risk_silver.yaml  v9 — Trend Follower 15m
+# config/params.yaml  v10 — BTC 1m, мелкий TP
 #
-# ЛОГИКА ИЗ ДАННЫХ:
-#   Январь (шорты): hit=31%, avg_win=71₽, avg_loss=-22₽
-#   → R:R реальный=3.24, PF=1.48 ✅
-#   → При TP=3.0 ATR достаточно попадать в 23% сделок!
-#
-#   Март (лонги против падения): hit=27%, avg_win=31₽
-#   → avg_win в 2.3× меньше чем в январе
-#   → Причина: лонги против нисходящего тренда
-#   → Fix: Direction Lock — торгуем ТОЛЬКО по тренду
-#
-# ИЗМЕНЕНИЯ vs v7:
-#   - atr_tp: 2.25 → 3.0  (даём прибыли течь до 4.5%)
-#   - global_trend.strict_lock: true  (жёсткая блокировка контртренда)
-#   - global_trend_timeframe: "4h" (лучше недельный тренд)
-#   - allowed_hours: оставлены рабочие по данным
+# BTC:
+#   SL = 1.0 ATR
+#   TP = 0.05 ATR → R:R ≈ 0.05
+#   Частые, короткие тейки, Direction Lock выключен для BTC.
 # ============================================================
 
 instruments:
@@ -25,32 +14,26 @@ instruments:
     lot: 1
     currency: "RUB"
     global_figi: "FUTSILVM0626"
+    enabled: false
+
+  - ticker: "BTCUSDperpA"
+    name: "BTCUSDT perp"
+    figi: "BTCUSDPERP00"
+    lot: 1
+    currency: "RUB"
+    global_figi: "BTCUSDPERP00"
     enabled: true
+    # Специальные параметры стратегии для BTC
+    atr_sl_multiplier: 1.0
+    atr_tp_multiplier: 0.05
+    # Фильтры помягче для частых входов
+    min_body_pct: 0.05          # тело свечи от ATR
+    min_atr_pct: 0.0005
+    ema_gap_min_pct: 0.0
+    # Глобальный тренд для BTC можно ослабить
+    use_global_trend: false
 
-  - ticker: "BRM6"
-    figi: "FUTBR0626000"
-    lot: 1
-    currency: "RUB"
-    global_figi: "FUTBR0626000"
-    enabled: false
-
-  - ticker: "GDM6"
-    figi: "FUTGOLD06260"
-    lot: 1
-    currency: "RUB"
-    global_figi: ""
-    enabled: false
-
-  - ticker: "NGM6"
-    figi: "FUTNG0626000"
-    lot: 1
-    currency: "RUB"
-    global_figi: ""
-    enabled: false
-
-timeframe: "15m"
-# 4h даёт недельный тренд — именно то что нужно
-# для понимания "сегодня серебро растёт или падает"
+timeframe: "5m"
 global_trend_timeframe: "4h"
 
 strategy:
@@ -67,15 +50,10 @@ strategy:
 
   atr_period: 14
 
-  # КЛЮЧЕВЫЕ ПАРАМЕТРЫ v9:
-  # SL = 0.9 ATR ≈ 0.9% → тесный стоп
-  # TP = 3.0 ATR ≈ 4.5% → даём движению раскрыться
-  # R:R = 3.33 → break-even при 23% hit rate
-  # (январские данные показали реальный R:R 3.24 при тех же условиях)
-  atr_sl_multiplier: 0.9
-  atr_tp_multiplier: 3.0
+  # Базовые параметры (для инструментов без override)
+  atr_sl_multiplier: 1.0
+  atr_tp_multiplier: 0.05
 
-  # Фильтры минимальные
   atr_expansion_mult: 1.0
   volume_ma_period: 20
   volume_spike_mult: 1.0
@@ -89,22 +67,17 @@ strategy:
   trade_only_in_windows: true
   evening_boost_start: "16:00"
 
-  # Trailing: переносим SL в безубыток когда цена прошла 1.5 ATR
-  # (логика реализована в backtester через position tracking)
   trailing_trigger_atr: 1.5
 
   # ── Фильтр часов ──────────────────────────────────────
-  # По данным двух месяцев:
-  # Устойчиво прибыльные: 09, 10, 15, 18, 21, 22
-  # Убыточные: 14, 16, 17, 19, 20, 23
   allowed_hours:
     S1M6:    [10, 11, 12, 13, 14, 15, 16, 18, 21]
+    # Для BTC разрешаем все часы, чтобы не душить сигналы
+    BTCUSDperpA: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+                  15, 16, 17, 18, 19, 20, 21, 22, 23]
     default: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
 
-  # ── Direction Lock (главное в v9) ─────────────────────
-  # strict_lock: true → глобальный BEAR = нет лонгов вообще
-  #                      глобальный BULL = нет шортов вообще
-  # flat_gap_pct: 0.003 → EMA должны разойтись на 0.3% чтобы не FLAT
+  # ── Direction Lock ─────────────────────────────────────
   global_trend:
     enabled: true
     ema_fast: 20
@@ -120,13 +93,12 @@ strategy:
 
 risk:
   capital_rub: 1000.0
-  max_position_pct: 1
+  max_position_pct: 1       # до 100% капитала под позицию (для расчёта)
   max_leverage: 8
 
-  daily_loss_limit_pct: 0.20
-  weekly_loss_limit_pct: 0.40
+  daily_loss_limit_pct: 100
+  weekly_loss_limit_pct: 100
 
-  max_trades_per_day: 15
   allow_shorts: true
   max_consecutive_losses: 8
   cooldown_after_loss_min: 3
