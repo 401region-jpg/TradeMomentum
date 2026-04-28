@@ -161,5 +161,3 @@ class BrokerClient(ABC):
         Возвращает текущую нетто-позицию (+ лонг, - шорт, 0 = нет).
         """
         raise NotImplementedError
-```
-
