@@ -97,3 +97,69 @@ class BrokerClient(ABC):
     @abstractmethod
     async def sync_positions(self) -> None:
         ...
+
+# broker/base.py (дополнение к существующим методам)
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import List, Optional
+
+
+@dataclass
+class ActiveOrder:
+    order_id: str
+    side: str          # "BUY" / "SELL"
+    price: float
+    qty: int
+    created_at: float  # timestamp
+
+
+class BrokerClient(ABC):
+    # --- существующие методы ---
+    @abstractmethod
+    def place_order(self, figi: str, side: str, qty: int, order_type: str) -> str:
+        """Рыночный ордер. Возвращает order_id."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_positions(self) -> list:
+        raise NotImplementedError
+
+    # --- НОВЫЕ методы для MM ---
+    @abstractmethod
+    def place_limit_order(self, figi: str, side: str, qty: int, price: float) -> str:
+        """
+        Выставляет лимитный ордер.
+        Возвращает order_id (строка).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def cancel_order(self, order_id: str) -> bool:
+        """
+        Отменяет ордер по ID.
+        Возвращает True при успехе.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_active_orders(self, figi: str) -> List[ActiveOrder]:
+        """
+        Возвращает список активных ордеров по инструменту.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_order_book(self, figi: str, depth: int = 20) -> dict:
+        """
+        Возвращает стакан: {"bids": [(price, qty)], "asks": [(price, qty)]}
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_position_qty(self, figi: str) -> int:
+        """
+        Возвращает текущую нетто-позицию (+ лонг, - шорт, 0 = нет).
+        """
+        raise NotImplementedError
+```
+
