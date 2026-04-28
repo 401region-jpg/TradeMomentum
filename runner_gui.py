@@ -20,6 +20,11 @@ import logging.handlers
 import os
 import random
 import sys
+import time
+import logging
+from strategy.order_book_mm import OrderBookMMStrategy
+from strategy.base import OrderBookState, PositionState
+from data.trend_feed import TrendFeed
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -30,6 +35,7 @@ import psutil
 import yaml
 
 logger = logging.getLogger(__name__)
+FIGI_BTCUSD_PERP = "BTCUSDPERP00"
 
 # ── State / PID для GUI ──────────────────────────────────────────────────────
 
@@ -1224,3 +1230,158 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+def run_mm_live(params: dict, broker, notifier=None, state_writer=None):
+    """
+    Основной MM-цикл для LIVE / Paper режима.
+    Принимает брокера (TinkoffBrokerClient или PaperBrokerClient).
+    """
+    strategy = OrderBookMMStrategy(params)
+    risk_mgr = RiskManager(params)
+
+    trend_cfg = params.get("trend_feed", {})
+    trend_feed = TrendFeed(
+        symbol=trend_cfg.get("symbol", "BTCUSDT"),
+        interval=trend_cfg.get("interval", "1h"),
+        ema_fast=trend_cfg.get("ema_fast", 20),
+        ema_slow=trend_cfg.get("ema_slow", 50),
+        update_interval_minutes=trend_cfg.get("update_interval_minutes", 5),
+    )
+    trend_feed.start()
+
+    figi = params["instrument"]["figi"]
+    loop_interval = params["market_maker"].get("loop_interval_seconds", 3)
+
+    # Словарь для отслеживания выставленных ордеров: order_id → LimitOrderRequest
+    live_orders: dict[str, object] = {}
+
+    logger.info("MM loop started. figi=%s loop_interval=%ds", figi, loop_interval)
+
+    try:
+        while True:
+            t0 = time.time()
+
+            # 1. Получить стакан
+            try:
+                ob_raw = broker.get_order_book(figi, depth=20)
+            except Exception as e:
+                logger.error("get_order_book failed: %s", e)
+                time.sleep(loop_interval)
+                continue
+
+            bids, asks = ob_raw["bids"], ob_raw["asks"]
+            if not bids or not asks:
+                logger.warning("Empty order book, skipping")
+                time.sleep(loop_interval)
+                continue
+
+            best_bid  = bids[0][0]
+            best_ask  = asks[0][0]
+            mid_price = (best_bid + best_ask) / 2
+            spread_pct = (best_ask - best_bid) / mid_price * 100
+
+            ob = OrderBookState(
+                best_bid=best_bid,
+                best_ask=best_ask,
+                mid_price=mid_price,
+                spread_pct=spread_pct,
+                bids=bids,
+                asks=asks,
+                timestamp=time.time(),
+            )
+
+            # 2. Текущая позиция
+            net_qty = broker.get_position_qty(figi)
+            active_orders = broker.get_active_orders(figi)
+            active_buy  = sum(1 for o in active_orders if o.side == "BUY")
+            active_sell = sum(1 for o in active_orders if o.side == "SELL")
+
+            pos = PositionState(
+                net_qty=net_qty,
+                avg_entry=0.0,  # можно хранить в памяти
+                unrealized_pnl=0.0,
+                active_buy_orders=active_buy,
+                active_sell_orders=active_sell,
+            )
+
+            # 3. Проверить TTL старых ордеров → отменить просроченные
+            now = time.time()
+            for order in list(active_orders):
+                age = now - order.created_at
+                ttl = params["market_maker"].get("order_ttl_seconds", 30)
+                if age > ttl:
+                    logger.info("TTL expired, cancelling %s (age=%.0fs)", order.order_id, age)
+                    broker.cancel_order(order.order_id)
+
+            # 4. Получить желаемые ордера от стратегии
+            trend_bias = trend_feed.trend_bias
+            desired_orders = strategy.generate_orders(ob, pos, trend_bias)
+
+            # 5. Обновить (cancel+replace если нужно)
+            _sync_orders(broker, figi, active_orders, desired_orders, strategy, risk_mgr, ob)
+
+            # 6. Записать состояние для GUI
+            if state_writer:
+                state_writer({
+                    "mode": "mm_live",
+                    "equity": risk_mgr.capital_rub,
+                    "mid_price": mid_price,
+                    "spread_pct": round(spread_pct, 4),
+                    "trend_bias": trend_bias,
+                    "net_qty": net_qty,
+                    "active_orders": len(active_orders),
+                    "mm_stats": strategy.stats,
+                })
+
+            # 7. Пауза до следующего тика
+            elapsed = time.time() - t0
+            sleep_t = max(0, loop_interval - elapsed)
+            time.sleep(sleep_t)
+
+    except KeyboardInterrupt:
+        logger.info("MM loop stopped by user")
+    finally:
+        trend_feed.stop()
+        # Отменить все открытые ордера при выходе
+        for order in broker.get_active_orders(figi):
+            broker.cancel_order(order.order_id)
+        logger.info("All active orders cancelled on exit")
+
+
+def _sync_orders(broker, figi, active_orders, desired_orders, strategy, risk_mgr, ob):
+    """
+    Синхронизирует текущие активные ордера с желаемыми.
+    """
+    desired_by_side = {o.side.value: o for o in desired_orders}
+    active_by_side  = {}
+    for ao in active_orders:
+        active_by_side.setdefault(ao.side, []).append(ao)
+
+    for side_str, desired in desired_by_side.items():
+        existing = active_by_side.get(side_str, [])
+
+        if not existing:
+            # Выставляем новый ордер
+            allowed, reason = risk_mgr.check_can_place_order(
+                side=side_str,
+                active_orders=active_orders,
+                current_inventory=0,  # TODO: передавать из pos
+                price=desired.price,
+                qty=desired.qty,
+            )
+            if allowed:
+                oid = broker.place_limit_order(figi, side_str, desired.qty, desired.price)
+                logger.info("PLACE %s %.2f x%d → %s", side_str, desired.price, desired.qty, oid)
+            else:
+                logger.debug("SKIP %s: %s", side_str, reason)
+        else:
+            # Проверяем, нужно ли обновить цену
+            ao = existing[0]
+            if strategy.should_refresh(desired.price, ao.price):
+                broker.cancel_order(ao.order_id)
+                oid = broker.place_limit_order(figi, side_str, desired.qty, desired.price)
+                logger.info(
+                    "REFRESH %s %.2f → %.2f (drift) → %s",
+                    side_str, ao.price, desired.price, oid
+                )
+```
