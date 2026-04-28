@@ -1,12 +1,14 @@
 """
-risk/risk_manager.py  v5 + margin_per_lot
+risk/risk_manager.py  v6 — session risk + margin_per_lot + мягкий R:R
 
-Ключевые изменения:
+Ключевые моменты:
   - Сессионный риск: normal / boost / evening (разный max_position_pct)
-  - Портфельный счётчик сделок: max_trades_per_day суммарно по всем инструментам
-  - get_session_info() → возвращает pct для текущего времени МСК
-  - Логи показывают: "SESSION=BOOST | position_pct=8.0%"
+  - get_session_info() → возвращает (label, pct, require_trend) для текущего времени МСК
+  - Логи: "SESSION=BOOST | position_pct=8.0%"
   - УЧЁТ ГО: margin_per_lot — ограничивает qty по доступной марже
+  - Портфельный лимит сделок убран: бот может делать сколько угодно входов
+  - Ограничение по R:R ослаблено — низкий R:R не блокирует вход, только даёт warning
+  - Добавлена защита: дневной/недельный лимит по % капитала, защита от аномального PnL
 """
 
 from __future__ import annotations
@@ -21,7 +23,12 @@ import pytz
 logger = logging.getLogger(__name__)
 MSK = pytz.timezone("Europe/Moscow")
 
-MIN_RR = 2.0  # минимально допустимый R:R
+# Минимальный "рекомендованный" R:R для предупреждений
+MIN_RR = 0.1
+
+# Кап ДД/PNL на одну сделку (как доля капитала): если PnL по одной сделке > 5×cap,
+# считаем, что это ошибка расчёта или масштабов и жёстко режем.
+MAX_SINGLE_PNL_PCT = Decimal("5")  # 500% капитала на сделку — явно баг
 
 
 class RiskViolation(Exception):
@@ -37,10 +44,6 @@ class WeeklyLimitExceeded(RiskViolation):
 
 
 class MaxPositionsExceeded(RiskViolation):
-    pass
-
-
-class MaxTradesPerDayExceeded(RiskViolation):
     pass
 
 
@@ -63,9 +66,9 @@ class SessionConfig:
     def __init__(self, d: dict, fallback_pct: float):
         self.start = _parse_time(d.get("start", "00:00"))
         self.end = _parse_time(d.get("end", "23:59"))
-        self.position_pct = d.get("max_position_pct", fallback_pct)
+        self.position_pct = float(d.get("max_position_pct", fallback_pct))
         self.label = d.get("label", "UNKNOWN")
-        self.require_trend = d.get("require_global_trend", False)
+        self.require_trend = bool(d.get("require_global_trend", False))
 
 
 class RiskManager:
@@ -74,13 +77,21 @@ class RiskManager:
         r = cfg["risk"]
         s = cfg["strategy"]
 
+        # Базовый капитал (обновляется в рантайме по счёту брокера)
         self._capital = Decimal(str(r["capital_rub"]))
-        self._default_position_pct = r["max_position_pct"]
-        self._max_leverage = r["max_leverage"]
-        self._daily_loss_limit_pct = r["daily_loss_limit_pct"]
-        self._weekly_loss_limit_pct = r["weekly_loss_limit_pct"]
-        self._max_trades_per_day = r["max_trades_per_day"]  # портфельный лимит
-        self._max_positions = s["max_positions"]
+
+        # Базовый процент капитала под позицию (если нет сессий)
+        self._default_position_pct = float(r.get("max_position_pct", 1.0))
+
+        # Плечо (линейный множитель)
+        self._max_leverage = float(r.get("max_leverage", 1.0))
+
+        # Лимиты по дроудауну
+        self._daily_loss_limit_pct = float(r.get("daily_loss_limit_pct", 1.0))
+        self._weekly_loss_limit_pct = float(r.get("weekly_loss_limit_pct", 1.0))
+
+        # Лимит позиций одновременно
+        self._max_positions = int(s.get("max_positions", 1))
 
         # ГО на 1 лот (в рублях); если не задано, считаем, что не ограничивает
         self._margin_per_lot: Optional[Decimal] = None
@@ -88,39 +99,50 @@ class RiskManager:
         if margin_cfg is not None:
             try:
                 self._margin_per_lot = Decimal(str(margin_cfg))
-                logger.info("Margin per lot (ГО) задан: %.2f ₽", float(self._margin_per_lot))
+                logger.info(
+                    "Margin per lot (ГО) задан: %.2f ₽", float(self._margin_per_lot)
+                )
             except Exception:
                 logger.warning("Не удалось распарсить margin_per_lot=%r", margin_cfg)
 
-        self._max_consec_losses = r.get("max_consecutive_losses", 999)
-        self._cooldown_min = r.get("cooldown_after_loss_min", 0)
+        # Серия убытков и кулдаун
+        self._max_consec_losses = int(r.get("max_consecutive_losses", 999))
+        self._cooldown_min = int(r.get("cooldown_after_loss_min", 0))
 
-        # Проверка R:R
-        sl = s.get("atr_sl_multiplier", 1.0)
-        tp = s.get("atr_tp_multiplier", 2.0)
-        self._configured_rr = tp / sl if sl > 0 else 0
+        # Проверка R:R по конфигу стратегии
+        sl = float(s.get("atr_sl_multiplier", 1.0))
+        tp = float(s.get("atr_tp_multiplier", 2.0))
+        self._configured_rr = tp / sl if sl > 0 else 0.0
+
         if self._configured_rr < MIN_RR:
+            # Низкий R:R — только предупреждение, входы не блочим
             logger.warning(
-                "⚠️  R:R=%.2f < %.1f (минимум). Скорректируйте atr_sl/tp в params.yaml",
+                "⚠️  Низкий R:R=%.2f < %.1f. Проверьте atr_sl/atr_tp в params.yaml "
+                "(тейк очень близкий к стопу).",
                 self._configured_rr,
                 MIN_RR,
             )
         else:
-            logger.info("✅ R:R=%.2f (sl×%.1f / tp×%.1f)", self._configured_rr, sl, tp)
+            logger.info(
+                "✅ R:R=%.2f (sl×%.2f / tp×%.2f)", self._configured_rr, sl, tp
+            )
 
         # Сессионные конфиги
         ses_cfg = r.get("sessions", {})
         self._sessions: dict[str, SessionConfig] = {}
         for key in ("normal", "boost", "evening"):
-            if key in ses_cfg:
-                self._sessions[key] = SessionConfig(ses_cfg[key], self._default_position_pct)
+            cfg_ses = ses_cfg.get(key)
+            if cfg_ses:
+                self._sessions[key] = SessionConfig(cfg_ses, self._default_position_pct)
         if not self._sessions:
-            logger.info("Сессионный риск не настроен — используется базовый position_pct")
+            logger.info(
+                "Сессионный риск не настроен — используется базовый position_pct"
+            )
 
-        # Состояние (сбрасывается ежедневно)
+        # Состояние (сбрасывается ежедневно / еженедельно)
         self._day_pnl = Decimal("0")
         self._week_pnl = Decimal("0")
-        self._portfolio_trades = 0  # суммарно по всем инструментам за день
+        self._portfolio_trades = 0
         self._consec_losses = 0
         self._last_loss_time: Optional[datetime.datetime] = None
 
@@ -147,21 +169,49 @@ class RiskManager:
 
         msk_time = dt_utc.astimezone(MSK).time()
 
-        for key in ("boost", "evening", "normal"):  # boost проверяем первым
-            if key not in self._sessions:
+        # Приоритет: BOOST → EVENING → NORMAL
+        for key in ("boost", "evening", "normal"):
+            ses = self._sessions.get(key)
+            if not ses:
                 continue
-            ses = self._sessions[key]
             if ses.start <= msk_time <= ses.end:
                 return ses.label, ses.position_pct, ses.require_trend
 
         return "OFF_HOURS", 0.0, False
 
-    # ── Обновление ────────────────────────────────────────────────────────────
+    # ── Обновление капитала и PnL ─────────────────────────────────────────────
 
     def update_capital(self, c: Decimal) -> None:
+        """Обновление капитала по счёту брокера."""
+        if c <= 0:
+            logger.warning("Попытка обновить капитал некорректным значением: %.2f", float(c))
+            return
         self._capital = c
 
     def record_pnl(self, pnl: Decimal) -> None:
+        """
+        Регистрирует результат сделки, но с защитой от аномальных величин PnL.
+        Если PnL по модулю > MAX_SINGLE_PNL_PCT * capital, он обрезается.
+        """
+        if self._capital > 0:
+            limit_abs = self._capital * MAX_SINGLE_PNL_PCT
+            if pnl > limit_abs:
+                logger.error(
+                    "❌ Аномальный PnL=%.2f ₽ > %.0f×капитал (%.2f). Обрезаем до лимита.",
+                    float(pnl),
+                    float(MAX_SINGLE_PNL_PCT),
+                    float(limit_abs),
+                )
+                pnl = limit_abs
+            elif pnl < -limit_abs:
+                logger.error(
+                    "❌ Аномальный PnL=%.2f ₽ < -%.0f×капитал (%.2f). Обрезаем до лимита.",
+                    float(pnl),
+                    float(MAX_SINGLE_PNL_PCT),
+                    float(limit_abs),
+                )
+                pnl = -limit_abs
+
         self._day_pnl += pnl
         self._week_pnl += pnl
         self._portfolio_trades += 1
@@ -170,20 +220,18 @@ class RiskManager:
             self._consec_losses += 1
             self._last_loss_time = datetime.datetime.now(datetime.UTC)
             logger.warning(
-                "📉 Убыток %.2f ₽ | Серия: %d/%d | Портфель сделок: %d/%d",
+                "📉 Убыток %.2f ₽ | Серия: %d/%d | Сделок за день: %d",
                 float(pnl),
                 self._consec_losses,
                 self._max_consec_losses,
                 self._portfolio_trades,
-                self._max_trades_per_day,
             )
         else:
             self._consec_losses = 0
             logger.info(
-                "📈 Прибыль %.2f ₽ | Портфель сделок: %d/%d",
+                "📈 Прибыль %.2f ₽ | Сделок за день: %d",
                 float(pnl),
                 self._portfolio_trades,
-                self._max_trades_per_day,
             )
 
         logger.info(
@@ -214,14 +262,15 @@ class RiskManager:
         current_positions_count: int,
         dt_utc: Optional[datetime.datetime] = None,
     ) -> None:
+        """Комплексная проверка перед открытием новой позиции."""
         self._check_date_reset()
         self._check_daily_limit()
         self._check_weekly_limit()
-        self._check_portfolio_trades()  # портфельный лимит
         self._check_max_positions(current_positions_count)
         self._check_consecutive_losses()
         self._check_cooldown()
-        # Проверяем торговые часы
+
+        # Проверяем торговые часы по сессиям
         if self._sessions and dt_utc is not None:
             label, pct, _ = self.get_session_info(dt_utc)
             if pct <= 0:
@@ -243,13 +292,6 @@ class RiskManager:
                 f"(лимит -{float(limit):.2f} ₽)"
             )
 
-    def _check_portfolio_trades(self) -> None:
-        if self._portfolio_trades >= self._max_trades_per_day:
-            raise MaxTradesPerDayExceeded(
-                f"Портфельный лимит сделок: {self._portfolio_trades}/"
-                f"{self._max_trades_per_day}"
-            )
-
     def _check_max_positions(self, count: int) -> None:
         if count >= self._max_positions:
             raise MaxPositionsExceeded(f"Лимит позиций: {count}/{self._max_positions}")
@@ -267,7 +309,9 @@ class RiskManager:
             datetime.datetime.now(datetime.UTC) - self._last_loss_time
         ).total_seconds() / 60
         if elapsed < self._cooldown_min:
-            raise CooldownActive(f"Кулдаун: ещё {int(self._cooldown_min - elapsed)} мин")
+            raise CooldownActive(
+                f"Кулдаун: ещё {int(self._cooldown_min - elapsed)} мин"
+            )
 
     def _check_date_reset(self) -> None:
         today = datetime.date.today()
@@ -296,15 +340,37 @@ class RiskManager:
         margin_per_lot — ГО на 1 контракт (если None — используем self._margin_per_lot)
         """
         if sl_distance <= 0 or price <= 0:
+            logger.warning(
+                "calculate_quantity: некорректные price/sl_distance: price=%.4f sl=%.4f",
+                float(price),
+                float(sl_distance),
+            )
             return 0
 
+        # Ограничение по R:R теперь не блокирует вход, только предупреждает
         if self._configured_rr < MIN_RR:
-            logger.error("❌ R:R=%.2f < %.1f → вход запрещён", self._configured_rr, MIN_RR)
-            return 0
+            logger.warning(
+                "⚠️ Низкий R:R=%.2f < %.1f — расчёт qty разрешён, но настройка atr_sl/atr_tp выглядит агрессивной.",
+                self._configured_rr,
+                MIN_RR,
+            )
 
         # Определяем session position_pct
         ses_label, ses_pct, _ = self.get_session_info(dt_utc)
-        position_pct = ses_pct if self._sessions else self._default_position_pct
+        position_pct = float(ses_pct if self._sessions else self._default_position_pct)
+
+        # Защита: не позволяем использовать >100% капитала на сделку
+        if position_pct > 1.0:
+            logger.warning(
+                "position_pct=%.2f > 1.0 — урезаем до 100%% капитала.",
+                position_pct,
+            )
+            position_pct = 1.0
+        if position_pct <= 0:
+            logger.warning(
+                "position_pct=0 для сессии %s — qty=0", ses_label
+            )
+            return 0
 
         logger.info(
             "SESSION=%s | position_pct=%.1f%% | capital=%.2f ₽",
@@ -316,11 +382,11 @@ class RiskManager:
         leverage = Decimal(str(self._max_leverage))
         capital_dec = self._capital
 
-        # 1) Ограничение по стоимости позиции
+        # 1) Ограничение по стоимости позиции (капитал × pct × leverage)
         max_pos_val = capital_dec * Decimal(str(position_pct)) * leverage
         lots_cap = int(max_pos_val / (price * lot_size))
 
-        # 2) Ограничение по стоп‑риску
+        # 2) Ограничение по стоп‑риску (капитал × pct под стоп)
         risk_budget = capital_dec * Decimal(str(position_pct))
         risk_per_lot = sl_distance * lot_size
         lots_risk = int(risk_budget / risk_per_lot) if risk_per_lot > 0 else 0
@@ -356,9 +422,9 @@ class RiskManager:
             )
         else:
             sl_risk = float(sl_distance) * qty * lot_size
-            tp_goal = sl_risk * self._configured_rr
+            tp_goal = sl_risk * float(self._configured_rr)
             logger.info(
-                "📊 %s | %d лот(ов) @ %.4f | R:R=%.1f | SL-риск=%.2f ₽ | TP-цель=%.2f ₽ "
+                "📊 %s | %d лот(ов) @ %.4f | R:R=%.2f | SL-риск=%.2f ₽ | TP-цель=%.2f ₽ "
                 "(cap=%d risk=%d margin=%d)",
                 ses_label,
                 qty,
