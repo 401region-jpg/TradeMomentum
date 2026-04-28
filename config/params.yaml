@@ -213,3 +213,9 @@ notifications:
   on_no_data: true
   daily_summary_time: "18:55"
   weekly_summary_day: "friday"
+
+logging:
+  level: "DEBUG"
+  file: "logs/bot_btc_mm_debug.log"
+  max_bytes: 10485760
+  backup_count: 5
