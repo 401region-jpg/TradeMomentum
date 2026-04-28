@@ -110,4 +110,3 @@ class TrendFeed:
                 logger.warning("TrendFeed error: %s", exc)
 
             self._stop_event.wait(timeout=self.update_interval)
-```
