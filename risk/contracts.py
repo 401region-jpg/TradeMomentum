@@ -48,6 +48,14 @@ LOCAL_CONTRACTS_BY_TICKER: Dict[str, FuturesContractSpec] = {
         min_price_increment_amount=Decimal("7.5"),   # TODO: уточнить/переписать из API
         contract_size=Decimal("10"),                 # TODO: уточнить basic_asset_size
     ),
+    "BTCUSDperpA": FuturesContractSpec(
+        ticker="BTCUSDperpA",
+        figi=None,              # можно будет заполнить после первого вызова API
+        class_code="SPBFUT",    # для фьючей MOEX
+        min_price_increment=Decimal("0.01"),        # шаг цены, 1 пункт = 0.01
+        min_price_increment_amount=Decimal("0.01"), # стоимость 1 пункта = 0.01 ₽
+        contract_size=Decimal("1"),                 # 1 контракт
+    ),
 }
 
 # кэш загруженных из API контрактов
