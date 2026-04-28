@@ -1,26 +1,11 @@
-# === существующий код оставляем как есть ===
-class Strategy(ABC):
-
-    @abstractmethod
-    def name(self) -> str:
-        ...
-
-    @abstractmethod
-    def generate_signals(self, df: pd.DataFrame, ticker: str) -> list[Signal]:
-        ...
-
-    @abstractmethod
-    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        ...
+# strategy/base.py
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import List, Optional
+from enum import Enum
 
 
-# === НОВЫЙ БЛОК ДЛЯ MARKET MAKER СТРАТЕГИЙ ===
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
-from enum import Enum as _Enum
-
-
-class Side(str, _Enum):
+class Side(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
 
@@ -40,18 +25,30 @@ class OrderBookState:
     best_ask: float
     mid_price: float
     spread_pct: float
-    bids: List[Tuple[float, float]]  # [(price, qty), ...]
-    asks: List[Tuple[float, float]]
+    bids: List[tuple]  # [(price, qty), ...]
+    asks: List[tuple]
     timestamp: float
 
 
 @dataclass
 class PositionState:
-    net_qty: int          # +лонг, -шорт, 0 = нет
+    net_qty: int          # + лонг, - шорт, 0 = нет
     avg_entry: float
     unrealized_pnl: float
     active_buy_orders: int
     active_sell_orders: int
+
+
+class Strategy(ABC):
+    """Старый интерфейс — свечной (momentum)."""
+
+    @abstractmethod
+    def generate_signals(self, candles) -> dict:
+        raise NotImplementedError
+
+    @abstractmethod
+    def add_indicators(self, df):
+        raise NotImplementedError
 
 
 class MarketMakerStrategy(ABC):
