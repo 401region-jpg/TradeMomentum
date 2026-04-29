@@ -4,9 +4,19 @@ runner_gui.py — упрощённый раннер под GUI (paper + live)
 Использует те же модули, что runner.py, но:
 - добавляет online-лог trades/live_log.csv;
 - гарантированно и часто обновляет state/bot_state.json для GUI;
-- восстанавливает состояние позиций при рестарте;
+- восстанавливает состояние позиций при рестарте (с SL/TP через live_positions.json);
 - добавляет детальное логирование открытий/закрытий для отладки SL/TP;
-- добавляет метрики (PnL%, дистанция) в state.
+- добавляет метрики (PnL%, дистанция) в state;
+- OrderTracker: ждёт реального исполнения, учитывает частичные заполнения;
+- Cooldown на сигналы — защита от спама ордерами;
+- SL/TP = 0 guard — восстановленные без уровней позиции не закрываются ложно;
+- Reconciliation с брокером при старте — сверяет persist-файл с реальным счётом.
+
+АРХИТЕКТУРА:
+  run_paper()   — бэктест на живом потоке (MomentumStrategy)
+  run_live()    — LIVE исполнение (MomentumStrategy)
+  run_mm_live() — LIVE Market Making (OrderBookMMStrategy) — отдельная модель,
+                  НЕ смешивается с Momentum. Запускается отдельно.
 """
 
 from __future__ import annotations
@@ -21,7 +31,6 @@ import os
 import random
 import sys
 import time
-import logging
 from strategy.order_book_mm import OrderBookMMStrategy
 from strategy.base import OrderBookState, PositionState
 from data.trend_feed import TrendFeed
@@ -44,9 +53,14 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 STATE_PATH = STATE_DIR / "bot_state.json"
 STOP_FLAG_PATH = STATE_DIR / "stop.flag"
+# Файл хранения позиций с SL/TP между перезапусками
+POSITIONS_PERSIST_PATH = STATE_DIR / "live_positions.json"
 
 # заглушка для универсального пути (если будешь использовать в других модулях)
 BOT_STATE_PATH = STATE_PATH
+
+# Cooldown между сигналами на один тикер (сек) — защита от спама ордерами
+SIGNAL_COOLDOWN_SEC = 60
 
 
 def read_bot_state() -> dict:
@@ -109,7 +123,100 @@ def is_pid_running(pid: int) -> bool:
         return False
 
 
-from decimal import Decimal
+# ── Persistence позиций с SL/TP (выживает рестарт) ───────────────────────────
+
+def save_live_positions(positions: dict) -> None:
+    """Сохраняет live_positions (с SL/TP) в JSON для восстановления после рестарта."""
+    try:
+        data = {
+            ticker: {
+                **pos,
+                "entry_price": str(pos["entry_price"]),
+                "sl": str(pos["sl"]),
+                "tp": str(pos["tp"]),
+            }
+            for ticker, pos in positions.items()
+        }
+        POSITIONS_PERSIST_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    except Exception as e:
+        logger.warning("Не удалось сохранить позиции в %s: %s", POSITIONS_PERSIST_PATH, e)
+
+
+def load_live_positions() -> dict:
+    """Загружает ранее сохранённые позиции (с SL/TP) при рестарте."""
+    try:
+        if POSITIONS_PERSIST_PATH.exists():
+            raw = json.loads(POSITIONS_PERSIST_PATH.read_text(encoding="utf-8"))
+            return {
+                ticker: {
+                    **pos,
+                    "entry_price": Decimal(pos["entry_price"]),
+                    "sl": Decimal(pos["sl"]),
+                    "tp": Decimal(pos["tp"]),
+                }
+                for ticker, pos in raw.items()
+            }
+    except Exception as e:
+        logger.warning("Не удалось загрузить позиции из %s: %s", POSITIONS_PERSIST_PATH, e)
+    return {}
+
+
+# ── OrderTracker — отслеживание статуса ордера после выставления ─────────────
+
+class OrderTracker:
+    """
+    Опрашивает брокера после place_market_order до получения итогового статуса.
+    Решает проблему fire-and-forget: мы знаем реальный filled_price и filled_qty.
+    """
+
+    def __init__(self, broker, poll_interval: float = 0.5, max_polls: int = 30):
+        self._broker = broker
+        self._poll_interval = poll_interval
+        self._max_polls = max_polls
+
+    async def wait_fill(self, order_id: str):
+        """
+        Ждёт исполнения ордера. Возвращает объект статуса или None при таймауте.
+        Брокер должен поддерживать get_order_state(order_id).
+        """
+        if not hasattr(self._broker, "get_order_state"):
+            return None  # брокер не поддерживает — работаем как раньше
+
+        TERMINAL = {"filled", "rejected", "cancelled", "expired"}
+        for attempt in range(self._max_polls):
+            await asyncio.sleep(self._poll_interval)
+            try:
+                state = await self._broker.get_order_state(order_id)
+                status = getattr(state, "status", None)
+                if status is not None and str(status).lower() in TERMINAL:
+                    logger.debug(
+                        "OrderTracker: %s → статус=%s после %d попыток",
+                        order_id, status, attempt + 1,
+                    )
+                    return state
+            except Exception as e:
+                logger.warning("OrderTracker: ошибка опроса %s (попытка %d): %s", order_id, attempt + 1, e)
+
+        logger.warning(
+            "OrderTracker: таймаут ожидания ордера %s (%d попыток × %.1fс)",
+            order_id, self._max_polls, self._poll_interval,
+        )
+        return None
+
+
+# ── Signal cooldown — защита от дублирующихся сигналов ───────────────────────
+
+_signal_last_time: dict[str, datetime] = {}
+
+
+def _cooldown_ok(ticker: str, now: datetime, cooldown_sec: int = SIGNAL_COOLDOWN_SEC) -> bool:
+    """Возвращает True, если с последнего сигнала прошло достаточно времени."""
+    last = _signal_last_time.get(ticker)
+    if last is not None and (now - last).total_seconds() < cooldown_sec:
+        return False
+    _signal_last_time[ticker] = now
+    return True
+
 
 # ── Универсальный helper для PnL по фьючам ───────────────────────────────────
 
@@ -267,13 +374,13 @@ async def run_paper(cfg: dict) -> None:
     from notifications.notifier_telegram import TelegramNotifier
     from risk.risk_manager import RiskManager, RiskViolation
     from strategy.base import SignalType
-    from strategy.momentum import MomentumStrategy, compute_global_trend
+    from strategy.order_book_mm import OrderBookMM
 
     # очищаем возможный старый стоп-флаг
     if STOP_FLAG_PATH.exists():
         STOP_FLAG_PATH.unlink(missing_ok=True)
 
-    strategy = MomentumStrategy(cfg)
+    strategy = OrderBookMM(cfg)
     risk = RiskManager(cfg)
     broker = PaperBrokerClient(Decimal(str(cfg["risk"]["capital_rub"])))
     notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, cfg)
@@ -409,7 +516,8 @@ async def run_paper(cfg: dict) -> None:
         write_bot_state(state)
 
     try:
-        async for candle in feed.stream_candles(figis, tf_main):
+        tf_main = cfg["timeframe"]
+        async for figi, ob, candle in feed.stream_mm_data(figis, tf_main):
             # Проверка стоп-флага от GUI
             if STOP_FLAG_PATH.exists():
                 logger.warning("Получен стоп-флаг от GUI. Останавливаю paper-loop.")
@@ -729,40 +837,75 @@ async def run_live(cfg: dict) -> None:
         live_confirmed=True,  # GUI live всегда с явным подтверждением через кнопку
     )
 
+    # --- LIVE: OrderTracker для контроля статуса после выставления ордеров ---
+    order_tracker = OrderTracker(broker, poll_interval=0.5, max_polls=30)
+
     # --- LIVE: Восстановление позиций при старте ---
-    live_positions: dict[str, dict] = {}
-    
+    # Шаг 1: загружаем сохранённые позиции с SL/TP из файла
+    live_positions: dict[str, dict] = load_live_positions()
+
+    if live_positions:
+        logger.info(
+            "[LIVE] Загружены сохранённые позиции из %s: %s",
+            POSITIONS_PERSIST_PATH,
+            list(live_positions.keys()),
+        )
+
+    # Шаг 2: сверяем с реальным состоянием счёта через брокера
+    now_utc = datetime.now(tz=timezone.utc)
     try:
         open_positions = await broker.get_positions()
     except Exception as e:
         logger.warning("[LIVE] Не удалось получить текущие позиции при старте: %s", e)
         open_positions = []
 
-    now_utc = datetime.now(tz=timezone.utc)
-
+    broker_tickers = set()
     for p in open_positions:
         ticker = p.ticker
         qty = int(p.quantity)
         if qty == 0:
             continue
+        broker_tickers.add(ticker)
+        if ticker in live_positions:
+            # позиция уже есть в persist-файле → обновляем только qty/avg_price
+            # SL/TP сохраняем из файла (они точные)
+            live_positions[ticker]["qty"] = abs(qty)
+            live_positions[ticker]["entry_price"] = Decimal(str(p.avg_price))
+            logger.info(
+                "[LIVE] Sync: %s qty=%d entry=%.4f | SL=%.4f TP=%.4f (из файла)",
+                ticker, abs(qty), float(p.avg_price),
+                float(live_positions[ticker]["sl"]),
+                float(live_positions[ticker]["tp"]),
+            )
+        else:
+            # позиция есть на бирже, но файла нет → SL/TP неизвестны
+            live_positions[ticker] = {
+                "side": "long" if qty > 0 else "short",
+                "qty": abs(qty),
+                "entry_price": Decimal(str(p.avg_price)),
+                "sl": Decimal("0"),   # SL неизвестен — SL/TP check будет пропущен
+                "tp": Decimal("0"),   # TP неизвестен
+                "entry_time": now_utc.isoformat(),
+                "entry_candle_time": None,
+                "_recovered_no_levels": True,  # маркер для логгирования
+            }
+            logger.warning(
+                "[LIVE] Позиция %s (qty=%d) восстановлена из брокера БЕЗ SL/TP. "
+                "Торговля по ней возобновится, но SL/TP не будут отслеживаться до закрытия.",
+                ticker, abs(qty),
+            )
 
-        # Восстанавливаем только факт наличия позиции.
-        # SL/TP теряются, так как хранятся только в памяти бота.
-        live_positions[ticker] = {
-            "side": "long" if qty > 0 else "short",
-            "qty": abs(qty),
-            "entry_price": Decimal(str(p.avg_price)),
-            "sl": Decimal("0"),  # SL/TP неизвестны
-            "tp": Decimal("0"),  # SL/TP неизвестны
-            "entry_time": now_utc.isoformat(),
-            "entry_candle_time": None,
-        }
+    # Удаляем из live_positions тикеры, которых нет в брокере (позиция уже закрыта)
+    stale = [t for t in list(live_positions) if t not in broker_tickers and open_positions]
+    for t in stale:
+        logger.warning("[LIVE] Позиция %s есть в файле, но не в брокере — удаляем.", t)
+        del live_positions[t]
 
     if live_positions:
         logger.warning(
-            "[LIVE] Восстановлены открытые позиции при старте: %s. "
-            "ВНИМАНИЕ: Уровни SL/TP сброшены, так как не сохранялись в бирже.",
-            {t: dict(side=v["side"], qty=v["qty"], entry_price=str(v["entry_price"])) for t, v in live_positions.items()},
+            "[LIVE] Итоговые активные позиции: %s",
+            {t: {"side": v["side"], "qty": v["qty"], "sl": str(v["sl"]), "tp": str(v["tp"])}
+             for t, v in live_positions.items()},
         )
 
     # --- LIVE: синхронизируем капитал с реальным счётом ---
@@ -828,11 +971,24 @@ async def run_live(cfg: dict) -> None:
     stop_reason = "штатная остановка"
     stop_notified = False
 
+    # ── Кэш equity — обновляем не чаще раза в 30 сек, чтобы не спамить API ──
+    _equity_cache: dict = {"value": None, "ts": 0.0}
+    EQUITY_REFRESH_SEC = 30.0
+
     async def snapshot_live_state(reason: str = "tick") -> None:
-        try:
-            total_equity = await broker.get_total_equity()
-        except Exception:
-            total_equity = None
+        nonlocal _equity_cache
+        now_ts = time.monotonic()
+
+        # Запрашиваем equity только при событиях (open/close/final) или раз в 30 сек
+        force_equity = reason not in ("tick", "periodic", "same_candle_skip_sl_tp")
+        if force_equity or (now_ts - _equity_cache["ts"]) >= EQUITY_REFRESH_SEC:
+            try:
+                _equity_cache["value"] = await broker.get_total_equity()
+                _equity_cache["ts"] = now_ts
+            except Exception:
+                pass  # используем предыдущее значение
+
+        total_equity = _equity_cache["value"]
 
         positions_view = []
 
@@ -893,7 +1049,8 @@ async def run_live(cfg: dict) -> None:
         write_bot_state(state)
 
     try:
-        async for candle in feed.stream_candles(figis, tf_main):
+        tf_main = cfg["timeframe"]
+        async for figi, ob, candle in feed.stream_mm_data(figis, tf_main):
             # Проверка стоп-флага от GUI
             if STOP_FLAG_PATH.exists():
                 logger.warning("Получен стоп-флаг от GUI. Останавливаю %s-loop.", mode_label)
@@ -923,6 +1080,15 @@ async def run_live(cfg: dict) -> None:
                 await snapshot_live_state(reason="tick")
                 continue
 
+            # ── Диагностика: видим когда реально приходит закрытая свеча ──
+            logger.info(
+                "[%s] СВЕЧА ЗАКРЫТА | time=%s close=%.2f buf=%d",
+                ticker,
+                candle.get("time") or candle.get("ts", "?"),
+                float(candle["close"]),
+                len(candle_buffers[figi]),
+            )
+
             gt_counter += 1
             if gt_enabled and gt_counter % gt_refresh_interval == 0:
                 inst = inst_by_ticker.get(ticker, {})
@@ -950,7 +1116,21 @@ async def run_live(cfg: dict) -> None:
                 await notifier.notify_error(f"Ошибка стратегии {ticker}", e)
                 continue
 
+            # ── Диагностика: что вернула стратегия ──
+            entry_sigs = [s for s in signals if s.is_entry]
+            logger.info(
+                "[%s] Сигналов всего=%d, входных=%d | позиций=%d",
+                ticker, len(signals), len(entry_sigs), len(live_positions),
+            )
+            for s in entry_sigs:
+                logger.info(
+                    "[%s]   → %s sl=%.4f tp=%.4f reason=%s",
+                    ticker, s.type, float(s.sl_price), float(s.tp_price),
+                    getattr(s, "reason", "?"),
+                )
+
             # SL/TP по уже открытым позициям
+            position_closed_this_tick = False
             if ticker in live_positions:
                 pos = live_positions[ticker]
 
@@ -960,32 +1140,43 @@ async def run_live(cfg: dict) -> None:
                     await snapshot_live_state(reason="same_candle_skip_sl_tp")
                     continue
 
-                close_reason: Optional[str] = None
-                close_price: Optional[Decimal] = None
+                # ── Защита от SL/TP = 0 (восстановленные без уровней позиции) ──
+                sl_known = pos["sl"] != Decimal("0")
+                tp_known = pos["tp"] != Decimal("0")
 
-                if pos["side"] == "long":
-                    if Decimal(str(candle["low"])) <= pos["sl"]:
-                        close_reason = "sl"
-                        close_price = pos["sl"]
-                    elif Decimal(str(candle["high"])) >= pos["tp"]:
-                        close_reason = "tp"
-                        close_price = pos["tp"]
-                else:
-                    if Decimal(str(candle["high"])) >= pos["sl"]:
-                        close_reason = "sl"
-                        close_price = pos["sl"]
-                    elif Decimal(str(candle["low"])) <= pos["tp"]:
-                        close_reason = "tp"
-                        close_price = pos["tp"]
-
-                if close_reason and close_price is not None:
-                    qty_to_close = pos["qty"]
-                    exit_direction = (
-                        OrderDirection.SELL if pos["side"] == "long" else OrderDirection.BUY
+                if not sl_known or not tp_known:
+                    logger.warning(
+                        "[%s] SL/TP не определены (позиция восстановлена без уровней). "
+                        "SL/TP check пропускается во избежание ложного закрытия.",
+                        ticker,
                     )
+                else:
+                    close_reason: Optional[str] = None
+                    close_price: Optional[Decimal] = None
 
-                    # >>> DEBUG LOG: LIVE CLOSE <<<
-                    logger.info(
+                    if pos["side"] == "long":
+                        if Decimal(str(candle["low"])) <= pos["sl"]:
+                            close_reason = "sl"
+                            close_price = pos["sl"]
+                        elif Decimal(str(candle["high"])) >= pos["tp"]:
+                            close_reason = "tp"
+                            close_price = pos["tp"]
+                    else:
+                        if Decimal(str(candle["high"])) >= pos["sl"]:
+                            close_reason = "sl"
+                            close_price = pos["sl"]
+                        elif Decimal(str(candle["low"])) <= pos["tp"]:
+                            close_reason = "tp"
+                            close_price = pos["tp"]
+
+                    if close_reason and close_price is not None:
+                        qty_to_close = pos["qty"]
+                        exit_direction = (
+                            OrderDirection.SELL if pos["side"] == "long" else OrderDirection.BUY
+                        )
+
+                        # >>> DEBUG LOG: LIVE CLOSE <<<
+                        logger.info(
                         "[%s] LIVE CLOSE %s | side=%s entry=%.4f sl=%.4f tp=%.4f low=%.4f high=%.4f",
                         ticker,
                         close_reason,
@@ -1056,16 +1247,23 @@ async def run_live(cfg: dict) -> None:
                     )
 
                     del live_positions[ticker]
+                    save_live_positions(live_positions)  # персистим удаление позиции
                     await snapshot_live_state(reason=f"close_{close_reason}")
-                    continue
+                    position_closed_this_tick = True
 
-            # Открытие новых позиций
+            # Открытие новых позиций (только если позиция не была закрыта в эту свечу)
             opened_here = False
-            for sig in signals:
+            if not position_closed_this_tick:
+              for sig in signals:
                 if not sig.is_entry or ticker in live_positions:
                     continue
 
                 price = Decimal(str(candle["close"]))
+
+                # Cooldown — защита от дублирующихся сигналов на одном тикере
+                if not _cooldown_ok(ticker, now_utc, cfg.get("signal_cooldown_sec", SIGNAL_COOLDOWN_SEC)):
+                    logger.debug("[%s] Сигнал пропущен (cooldown)", ticker)
+                    continue
 
                 try:
                     risk.check_entry_allowed(len(live_positions), now_utc)
@@ -1117,26 +1315,52 @@ async def run_live(cfg: dict) -> None:
                 if order.status.value == "rejected":
                     logger.error("[%s] Ордер отклонён: %s", ticker, order.error_message)
                     continue
+
+                # ── OrderTracker: ждём реального исполнения (не fire-and-forget) ──
+                final_qty = qty
                 entry_price = Decimal(str(order.filled_price)) if order.filled_price is not None else price
+
+                if getattr(order, "order_id", None):
+                    filled_state = await order_tracker.wait_fill(order.order_id)
+                    if filled_state is not None:
+                        # Частичное исполнение
+                        filled_qty = getattr(filled_state, "filled_qty", None) or \
+                                     getattr(filled_state, "lots_executed", None)
+                        filled_price = getattr(filled_state, "filled_price", None) or \
+                                       getattr(filled_state, "average_price", None)
+                        if filled_qty is not None and int(filled_qty) != qty:
+                            logger.warning(
+                                "[%s] Частичное исполнение: запрошено %d лотов, исполнено %d",
+                                ticker, qty, int(filled_qty),
+                            )
+                            final_qty = int(filled_qty)
+                        if filled_price is not None:
+                            entry_price = Decimal(str(filled_price))
+
+                if final_qty <= 0:
+                    logger.warning("[%s] Исполнено 0 лотов — позицию не открываем", ticker)
+                    continue
 
                 live_positions[ticker] = {
                     "side": "long" if sig.type == SignalType.LONG else "short",
-                    "qty": qty,
+                    "qty": final_qty,
                     "entry_price": entry_price,
                     "sl": sig.sl_price,
                     "tp": sig.tp_price,
                     "entry_time": now_utc.isoformat(),
                     "entry_candle_time": candle.get("time") or candle.get("ts"),
                 }
+                save_live_positions(live_positions)  # сохраняем SL/TP на диск
 
                 # >>> DEBUG LOG: LIVE OPEN <<<
                 logger.info(
-                    "[%s] LIVE OPEN | side=%s entry=%.4f sl=%.4f tp=%.4f candle_time=%s",
+                    "[%s] LIVE OPEN | side=%s entry=%.4f sl=%.4f tp=%.4f qty=%d candle_time=%s",
                     ticker,
                     live_positions[ticker]["side"],
                     float(entry_price),
                     float(live_positions[ticker]["sl"]),
                     float(live_positions[ticker]["tp"]),
+                    final_qty,
                     candle.get("time") or candle.get("ts"),
                 )
 
@@ -1144,7 +1368,7 @@ async def run_live(cfg: dict) -> None:
                     ticker,
                     direction.value,
                     entry_price,
-                    qty,
+                    final_qty,
                     sig.sl_price,
                     sig.tp_price,
                     sig.reason,
@@ -1155,7 +1379,7 @@ async def run_live(cfg: dict) -> None:
                     event="open",
                     ticker=ticker,
                     direction="buy" if sig.type == SignalType.LONG else "sell",
-                    qty=qty,
+                    qty=final_qty,
                     entry_price=entry_price,
                     exec_price=entry_price,
                     pnl=Decimal("0"),
@@ -1208,6 +1432,13 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = parse_args()
+
+    # ── Выставляем TRADER_LIVE_CONFIRMED до первого импорта config.settings ──
+    # config/settings.py проверяет эту переменную при импорте (module-level),
+    # поэтому её нужно установить ДО того как run_live() сделает lazy-import.
+    if args.mode == "live" and args.confirm_live:
+        os.environ.setdefault("TRADER_LIVE_CONFIRMED", "true")
+
     cfg = load_config(args.config)
     setup_logging(cfg)
 
@@ -1235,6 +1466,15 @@ def run_mm_live(params: dict, broker, notifier=None, state_writer=None):
     """
     Основной MM-цикл для LIVE / Paper режима.
     Принимает брокера (TinkoffBrokerClient или PaperBrokerClient).
+
+    ══════════════════════════════════════════════════════════════════════════
+    ВНИМАНИЕ: Это ОТДЕЛЬНАЯ архитектура — Market Making на стакане.
+    НЕ смешивать с run_live() / run_paper() (Momentum на свечах).
+    Две модели работают на разных принципах:
+      - Momentum: сигналы по свечам → открытие направленных позиций
+      - Market Making: котирование bid/ask → заработок на спреде
+    Для одновременного запуска обеих → отдельные процессы/конфиги.
+    ══════════════════════════════════════════════════════════════════════════
     """
     strategy = OrderBookMMStrategy(params)
     risk_mgr = RiskManager(params)
