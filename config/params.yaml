@@ -56,7 +56,7 @@ strategy:
   atr_period: 14
 
   # Базовые параметры (для инструментов без override)
-  atr_sl_multiplier: 1.0
+  atr_sl_multiplier: 2.0
   atr_tp_multiplier: 0.05
 
   atr_expansion_mult: 1.0
@@ -69,7 +69,7 @@ strategy:
 
   max_positions: 1
   close_before_session_end_min: 10
-  trade_only_in_windows: true
+  trade_only_in_windows: false
   evening_boost_start: "16:00"
 
   trailing_trigger_atr: 1.5
