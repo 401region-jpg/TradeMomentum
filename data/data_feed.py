@@ -10,11 +10,15 @@ BACKTEST DATE OVERRIDE:
 from __future__ import annotations
 
 import logging
+import asyncio
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, AsyncGenerator, Dict, List, Tuple
 
 import httpx
 import pandas as pd
+
+from strategy.base import OrderBookState
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +105,7 @@ class DataFeed(TinkoffRestClient):
             )
 
         chunk = CHUNK_DAYS.get(timeframe, 7)
-        rows  = []
+        rows: List[dict] = []
         cur   = from_dt
 
         while cur < to_dt:
@@ -178,8 +182,6 @@ class DataFeed(TinkoffRestClient):
         timeframe: str,
     ):
         """Потоковые свечи для paper/live через polling REST API."""
-        import asyncio
-
         interval = TIMEFRAME_MAP.get(timeframe)
         if not interval:
             raise ValueError(f"Неизвестный таймфрейм: {timeframe}")
@@ -189,7 +191,7 @@ class DataFeed(TinkoffRestClient):
             "1m": 30, "5m": 60, "15m": 120, "1h": 300, "4h": 600
         }.get(timeframe, 60)
 
-        last_times: dict[str, str] = {}
+        last_times: Dict[str, str] = {}
 
         logger.info(
             "Stream: опрос каждые %d сек для %d инструментов",
@@ -230,3 +232,105 @@ class DataFeed(TinkoffRestClient):
                     logger.error("Stream ошибка %s: %s", figi, e)
 
             await asyncio.sleep(poll_seconds)
+
+    # ─────────────────────  НОВОЕ: СТАКАН + MM  ──────────────────────────────
+
+    async def get_order_book(
+        self,
+        figi: str,
+        depth: int = 10,
+    ) -> dict:
+        """
+        Получение стакана через T-Invest REST API (MarketDataService/GetOrderBook).
+        """
+        try:
+            data = await self.post(
+                "MarketDataService",
+                "GetOrderBook",
+                {
+                    "figi": figi,
+                    "depth": depth,
+                },
+            )
+            return data or {}
+        except Exception as e:
+            logger.error("Ошибка загрузки стакана %s: %s", figi, e)
+            return {}
+
+    def _orderbook_to_state(self, ob_raw: dict) -> OrderBookState:
+        """Конвертация JSON T-Invest в OrderBookState."""
+        bids = ob_raw.get("bids", []) or []
+        asks = ob_raw.get("asks", []) or []
+
+        def _p(x: dict) -> float:
+            return _q(x.get("price", {}))
+
+        def _qnty(x: dict) -> float:
+            return float(x.get("quantity", 0))
+
+        best_bid = _p(bids[0]) if bids else 0.0
+        best_ask = _p(asks[0]) if asks else 0.0
+        mid = (best_bid + best_ask) / 2 if (best_bid and best_ask) else 0.0
+        spread_pct = ((best_ask - best_bid) / mid * 100) if mid else 0.0
+
+        bids_view: List[Tuple[float, float]] = [(_p(b), _qnty(b)) for b in bids[:5]]
+        asks_view: List[Tuple[float, float]] = [(_p(a), _qnty(a)) for a in asks[:5]]
+
+        return OrderBookState(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            mid_price=mid,
+            spread_pct=spread_pct,
+            bids=bids_view,
+            asks=asks_view,
+            timestamp=time.time(),
+        )
+
+    async def stream_orderbook(
+        self,
+        figi: str,
+        depth: int = 10,
+        poll_seconds: float = 0.5,
+    ) -> AsyncGenerator[OrderBookState, None]:
+        """
+        Псевдо-стрим стакана через периодический REST-поллинг.
+        """
+        while True:
+            ob_raw = await self.get_order_book(figi, depth=depth)
+            if ob_raw:
+                yield self._orderbook_to_state(ob_raw)
+            await asyncio.sleep(poll_seconds)
+
+    async def stream_mm_data(
+        self,
+        figis: list[str],
+        timeframe: str,
+        depth: int = 10,
+    ) -> AsyncGenerator[tuple[str, OrderBookState, dict], None]:
+        """
+        Комбинированный поток для MM:
+        на каждом шаге отдаёт (figi, OrderBookState, candle_dict).
+
+        Свечи берутся из stream_candles, стакан — из stream_orderbook.
+        """
+        candle_iters = {
+            figi: self.stream_candles([figi], timeframe)
+            for figi in figis
+        }
+        ob_iters = {
+            figi: self.stream_orderbook(figi, depth=depth)
+            for figi in figis
+        }
+
+        while True:
+            for figi in figis:
+                try:
+                    # Python <3.10: используем __anext__()
+                    candle = await candle_iters[figi].__anext__()
+                    ob = await ob_iters[figi].__anext__()
+                    yield figi, ob, candle
+                except StopAsyncIteration:
+                    continue
+                except Exception as e:
+                    logger.error("stream_mm_data ошибка %s: %s", figi, e)
+            await asyncio.sleep(0.05)
